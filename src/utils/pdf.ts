@@ -468,6 +468,125 @@ export async function hasEmbeddedText(
   return (totalChars / pagesToCheck) >= minCharsPerPage
 }
 
+/**
+ * Extract positioned text items from a page (with coordinates for table/layout extraction).
+ */
+export async function extractPositionedText(
+  pdfFile: PDFFile,
+  pageNumber: number,
+): Promise<{ text: string; x: number; y: number; width: number; height: number; page: number }[]> {
+  const doc = await getCachedDoc(pdfFile.id, pdfFile.data)
+  const page = await doc.getPage(pageNumber)
+  const viewport = page.getViewport({ scale: 1 })
+  const content = await page.getTextContent()
+  return content.items
+    .filter((item: any) => 'str' in item && item.str.trim())
+    .map((item: any) => ({
+      text: item.str,
+      x: item.transform[4],
+      y: viewport.height - item.transform[5],
+      width: item.width ?? 0,
+      height: Math.abs(item.transform[0]) || 12,
+      page: pageNumber,
+    }))
+}
+
+// ============================================
+// Line / Rule Extraction (for table grid detection)
+// ============================================
+
+export interface PageLine {
+  x1: number; y1: number
+  x2: number; y2: number
+}
+
+/**
+ * Extract horizontal and vertical line segments drawn on a PDF page.
+ * Uses the page's operator list to find stroke paths (table rules, borders).
+ * Coordinates are in doc-space (top-down Y, same as extractPositionedText).
+ */
+export async function extractPageLines(
+  pdfFile: PDFFile,
+  pageNumber: number,
+): Promise<{ horizontal: PageLine[]; vertical: PageLine[] }> {
+  const doc = await getCachedDoc(pdfFile.id, pdfFile.data)
+  const page = await doc.getPage(pageNumber)
+  const viewport = page.getViewport({ scale: 1 })
+  const ops = await page.getOperatorList()
+
+  const rawLines: { x1: number; y1: number; x2: number; y2: number }[] = []
+
+  for (let i = 0; i < ops.fnArray.length; i++) {
+    if (ops.fnArray[i] === pdfjsLib.OPS.constructPath) {
+      const subOps = ops.argsArray[i][0] as number[]
+      const args = ops.argsArray[i][1] as number[]
+
+      let argIdx = 0
+      let curX = 0, curY = 0
+      let startX = 0, startY = 0
+
+      for (const op of subOps) {
+        if (op === pdfjsLib.OPS.moveTo) {
+          curX = args[argIdx++]; curY = args[argIdx++]
+          startX = curX; startY = curY
+        } else if (op === pdfjsLib.OPS.lineTo) {
+          const x = args[argIdx++]; const y = args[argIdx++]
+          rawLines.push({
+            x1: curX, y1: viewport.height - curY,
+            x2: x, y2: viewport.height - y,
+          })
+          curX = x; curY = y
+        } else if (op === pdfjsLib.OPS.rectangle) {
+          const rx = args[argIdx++]; const ry = args[argIdx++]
+          const rw = args[argIdx++]; const rh = args[argIdx++]
+          const top = viewport.height - (ry + rh)
+          const bot = viewport.height - ry
+          // 4 edges of the rectangle
+          rawLines.push(
+            { x1: rx, y1: top, x2: rx + rw, y2: top },         // top
+            { x1: rx, y1: bot, x2: rx + rw, y2: bot },         // bottom
+            { x1: rx, y1: top, x2: rx, y2: bot },              // left
+            { x1: rx + rw, y1: top, x2: rx + rw, y2: bot },   // right
+          )
+          curX = rx; curY = ry
+        } else if (op === pdfjsLib.OPS.curveTo) {
+          argIdx += 6
+          curX = args[argIdx - 2]; curY = args[argIdx - 1]
+        } else if (op === pdfjsLib.OPS.curveTo2 || op === pdfjsLib.OPS.curveTo3) {
+          argIdx += 4
+          curX = args[argIdx - 2]; curY = args[argIdx - 1]
+        } else if (op === pdfjsLib.OPS.closePath) {
+          if (curX !== startX || curY !== startY) {
+            rawLines.push({
+              x1: curX, y1: viewport.height - curY,
+              x2: startX, y2: viewport.height - startY,
+            })
+            curX = startX; curY = startY
+          }
+        }
+      }
+    }
+  }
+
+  const tolerance = 2   // max deviation to classify as horizontal/vertical
+  const minLength = 10  // minimum length to count as a table rule
+
+  const horizontal: PageLine[] = []
+  const vertical: PageLine[] = []
+
+  for (const l of rawLines) {
+    const dx = Math.abs(l.x2 - l.x1)
+    const dy = Math.abs(l.y2 - l.y1)
+    if (dy <= tolerance && dx >= minLength) {
+      horizontal.push({ x1: Math.min(l.x1, l.x2), y1: (l.y1 + l.y2) / 2, x2: Math.max(l.x1, l.x2), y2: (l.y1 + l.y2) / 2 })
+    } else if (dx <= tolerance && dy >= minLength) {
+      vertical.push({ x1: (l.x1 + l.x2) / 2, y1: Math.min(l.y1, l.y2), x2: (l.x1 + l.x2) / 2, y2: Math.max(l.y1, l.y2) })
+    }
+  }
+
+  return { horizontal, vertical }
+}
+
 // ============================================
 // Cleanup
 // ============================================

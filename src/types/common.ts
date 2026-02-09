@@ -4,7 +4,6 @@ export type ToolId =
   | 'pdf-annotate'
   | 'pdf-watermark'
   | 'text-extract'
-  | 'ocr-extract'
   | 'image-resizer'
   | 'image-bg-remove'
   | 'file-compressor'

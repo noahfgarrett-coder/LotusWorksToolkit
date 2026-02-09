@@ -12,7 +12,6 @@ const toolComponents: Record<ToolId, React.LazyExoticComponent<React.ComponentTy
   'pdf-annotate': lazy(() => import('@/tools/pdf-annotate/PdfAnnotateTool.tsx')),
   'pdf-watermark': lazy(() => import('@/tools/pdf-watermark/WatermarkTool.tsx')),
   'text-extract': lazy(() => import('@/tools/text-extract/TextExtractTool.tsx')),
-  'ocr-extract': lazy(() => import('@/tools/ocr-extract/OcrExtractTool.tsx')),
   'image-resizer': lazy(() => import('@/tools/image-resizer/ImageResizerTool.tsx')),
   'image-bg-remove': lazy(() => import('@/tools/image-bg-remove/BgRemoveTool.tsx')),
   'file-compressor': lazy(() => import('@/tools/file-compressor/CompressorTool.tsx')),

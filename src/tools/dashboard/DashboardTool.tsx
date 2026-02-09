@@ -238,6 +238,7 @@ export default function DashboardTool() {
   const [layout, setLayout] = useState<LayoutItem[]>([])
   const [showAddModal, setShowAddModal] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const gridRef = useRef<HTMLDivElement>(null)
 
   // New widget form state
@@ -264,6 +265,7 @@ export default function DashboardTool() {
     const file = files[0]
     if (!file) return
     setIsLoading(true)
+    setLoadError(null)
     try {
       const { columns: cols, rows: r } = await parseDataFile(file)
       setColumns(cols)
@@ -273,7 +275,8 @@ export default function DashboardTool() {
       setWidgets([])
       setLayout([])
     } catch (err) {
-      console.error('Failed to parse file:', err)
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setLoadError(`Failed to parse file: ${msg}`)
     } finally {
       setIsLoading(false)
     }
@@ -369,6 +372,14 @@ export default function DashboardTool() {
         {isLoading && (
           <div className="text-center text-sm text-white/40">Loading data...</div>
         )}
+        {loadError && (
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+            <p className="text-sm text-red-400 flex-1">{loadError}</p>
+            <button onClick={() => setLoadError(null)} className="p-1 rounded text-red-400/60 hover:text-red-400 transition-colors" aria-label="Dismiss error">
+              <X size={14} />
+            </button>
+          </div>
+        )}
       </div>
     )
   }
@@ -420,7 +431,7 @@ export default function DashboardTool() {
                     <GripVertical size={12} />
                   </div>
                   <span className="text-[11px] text-white/70 font-medium flex-1 truncate">{w.title}</span>
-                  <button onClick={() => removeWidget(w.id)} className="p-0.5 text-white/15 hover:text-red-400 transition-colors">
+                  <button onClick={() => removeWidget(w.id)} className="p-0.5 text-white/15 hover:text-red-400 transition-colors" aria-label={`Delete ${w.title}`}>
                     <Trash2 size={11} />
                   </button>
                 </div>
@@ -440,7 +451,7 @@ export default function DashboardTool() {
           <div className="bg-[#12121a] border border-white/[0.1] rounded-xl p-5 w-[380px] space-y-4 shadow-2xl" onClick={e => e.stopPropagation()}>
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-medium text-white">Add Widget</h3>
-              <button onClick={() => setShowAddModal(false)} className="p-1 text-white/30 hover:text-white">
+              <button onClick={() => setShowAddModal(false)} className="p-1 text-white/30 hover:text-white" aria-label="Close modal">
                 <X size={14} />
               </button>
             </div>

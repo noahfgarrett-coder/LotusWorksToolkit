@@ -3,11 +3,18 @@ import { FileDropZone } from '@/components/common/FileDropZone.tsx'
 import { Button } from '@/components/common/Button.tsx'
 import { Slider } from '@/components/common/Slider.tsx'
 import { ProgressBar } from '@/components/common/ProgressBar.tsx'
-import { readFileAsDataURL, formatFileSize } from '@/utils/fileReader.ts'
-import { loadImage, resizeImage, canvasToBlob } from '@/utils/imageProcessing.ts'
+import { formatFileSize } from '@/utils/fileReader.ts'
 import { downloadBlob } from '@/utils/download.ts'
+import {
+  compressImage,
+  compressPDF,
+  compressSVG,
+  getCompressibleType,
+  getCompressedExtension,
+  type CompressibleType,
+} from '@/utils/compression.ts'
 import JSZip from 'jszip'
-import { Download, Trash2, Archive, Image as ImageIcon, Check } from 'lucide-react'
+import { Download, Trash2, Archive, Image as ImageIcon, FileText, FileCode, Check } from 'lucide-react'
 
 interface CompressFile {
   id: string
@@ -16,6 +23,7 @@ interface CompressFile {
   compressedBlob?: Blob
   compressedSize?: number
   status: 'pending' | 'processing' | 'done' | 'error'
+  fileType: CompressibleType
 }
 
 export default function CompressorTool() {
@@ -26,13 +34,18 @@ export default function CompressorTool() {
   const [progress, setProgress] = useState(0)
 
   const handleFiles = useCallback((newFiles: File[]) => {
-    const imageFiles = newFiles.filter((f) => f.type.startsWith('image/'))
-    const entries: CompressFile[] = imageFiles.map((file) => ({
-      id: Math.random().toString(36).substring(2, 11),
-      file,
-      originalSize: file.size,
-      status: 'pending',
-    }))
+    const entries: CompressFile[] = []
+    for (const file of newFiles) {
+      const fileType = getCompressibleType(file)
+      if (!fileType) continue
+      entries.push({
+        id: Math.random().toString(36).substring(2, 11),
+        file,
+        originalSize: file.size,
+        status: 'pending',
+        fileType,
+      })
+    }
     setFiles((prev) => [...prev, ...entries])
   }, [])
 
@@ -55,20 +68,18 @@ export default function CompressorTool() {
       setFiles([...updated])
 
       try {
-        const dataUrl = await readFileAsDataURL(entry.file)
-        const img = await loadImage(dataUrl)
-
-        // Resize if wider than maxWidth
-        let targetWidth = img.naturalWidth
-        let targetHeight = img.naturalHeight
-        if (targetWidth > maxWidth) {
-          const scale = maxWidth / targetWidth
-          targetWidth = maxWidth
-          targetHeight = Math.round(img.naturalHeight * scale)
+        let blob: Blob
+        switch (entry.fileType) {
+          case 'image':
+            blob = await compressImage(entry.file, quality, maxWidth)
+            break
+          case 'pdf':
+            blob = await compressPDF(entry.file, quality, maxWidth)
+            break
+          case 'svg':
+            blob = await compressSVG(entry.file)
+            break
         }
-
-        const canvas = resizeImage(img, targetWidth, targetHeight)
-        const blob = await canvasToBlob(canvas, 'image/jpeg', quality / 100)
 
         updated[i] = {
           ...entry,
@@ -93,7 +104,8 @@ export default function CompressorTool() {
     if (completedFiles.length === 1) {
       const f = completedFiles[0]
       const baseName = f.file.name.replace(/\.[^.]+$/, '')
-      downloadBlob(f.compressedBlob!, `${baseName}-compressed.jpg`)
+      const ext = getCompressedExtension(f.fileType)
+      downloadBlob(f.compressedBlob!, `${baseName}-compressed.${ext}`)
       return
     }
 
@@ -101,25 +113,27 @@ export default function CompressorTool() {
     const zip = new JSZip()
     for (const f of completedFiles) {
       const baseName = f.file.name.replace(/\.[^.]+$/, '')
-      zip.file(`${baseName}-compressed.jpg`, f.compressedBlob!)
+      const ext = getCompressedExtension(f.fileType)
+      zip.file(`${baseName}-compressed.${ext}`, f.compressedBlob!)
     }
     const zipBlob = await zip.generateAsync({ type: 'blob' })
-    downloadBlob(zipBlob, 'compressed-images.zip')
+    downloadBlob(zipBlob, 'compressed-files.zip')
   }, [files])
 
   const totalOriginal = files.reduce((sum, f) => sum + f.originalSize, 0)
   const totalCompressed = files.reduce((sum, f) => sum + (f.compressedSize ?? 0), 0)
   const allDone = files.length > 0 && files.every((f) => f.status === 'done')
   const savings = totalOriginal > 0 ? Math.round((1 - totalCompressed / totalOriginal) * 100) : 0
+  const hasNonSvgFiles = files.some((f) => f.fileType !== 'svg')
 
   if (files.length === 0) {
     return (
       <FileDropZone
         onFiles={handleFiles}
-        accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
+        accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,application/pdf,image/svg+xml,.svg,.pdf"
         multiple
-        label="Drop images to compress"
-        description="PNG, JPEG, WebP, GIF, or BMP"
+        label="Drop files to compress"
+        description="Images, PDFs, or SVGs"
         className="h-full"
       />
     )
@@ -140,7 +154,7 @@ export default function CompressorTool() {
           onClick={() => {
             const input = document.createElement('input')
             input.type = 'file'
-            input.accept = 'image/*'
+            input.accept = 'image/*,application/pdf,.pdf,image/svg+xml,.svg'
             input.multiple = true
             input.onchange = (e) => {
               const target = e.target as HTMLInputElement
@@ -165,31 +179,33 @@ export default function CompressorTool() {
         )}
       </div>
 
-      {/* Settings */}
-      <div className="flex gap-6 flex-shrink-0">
-        <div className="flex-1">
-          <Slider
-            label="Quality"
-            value={quality}
-            min={10}
-            max={95}
-            step={5}
-            suffix="%"
-            onChange={(e) => setQuality(Number((e.target as HTMLInputElement).value))}
-          />
+      {/* Settings (not relevant for SVG-only batches) */}
+      {hasNonSvgFiles && (
+        <div className="flex gap-6 flex-shrink-0">
+          <div className="flex-1">
+            <Slider
+              label="Quality"
+              value={quality}
+              min={10}
+              max={95}
+              step={5}
+              suffix="%"
+              onChange={(e) => setQuality(Number((e.target as HTMLInputElement).value))}
+            />
+          </div>
+          <div className="flex-1">
+            <Slider
+              label="Max Width"
+              value={maxWidth}
+              min={640}
+              max={4096}
+              step={128}
+              suffix="px"
+              onChange={(e) => setMaxWidth(Number((e.target as HTMLInputElement).value))}
+            />
+          </div>
         </div>
-        <div className="flex-1">
-          <Slider
-            label="Max Width"
-            value={maxWidth}
-            min={640}
-            max={4096}
-            step={128}
-            suffix="px"
-            onChange={(e) => setMaxWidth(Number((e.target as HTMLInputElement).value))}
-          />
-        </div>
-      </div>
+      )}
 
       {/* Progress */}
       {isCompressing && (
@@ -213,7 +229,13 @@ export default function CompressorTool() {
             key={entry.id}
             className="flex items-center gap-3 p-3 rounded-lg border border-white/[0.06] bg-white/[0.03]"
           >
-            <ImageIcon size={16} className="text-white/30 flex-shrink-0" />
+            {entry.fileType === 'pdf' ? (
+              <FileText size={16} className="text-red-400/60 flex-shrink-0" />
+            ) : entry.fileType === 'svg' ? (
+              <FileCode size={16} className="text-blue-400/60 flex-shrink-0" />
+            ) : (
+              <ImageIcon size={16} className="text-white/30 flex-shrink-0" />
+            )}
             <div className="flex-1 min-w-0">
               <p className="text-sm text-white truncate">{entry.file.name}</p>
               <p className="text-xs text-white/40">
@@ -236,6 +258,7 @@ export default function CompressorTool() {
 
             <button
               onClick={() => removeFile(entry.id)}
+              aria-label={`Remove ${entry.file.name}`}
               className="p-1.5 rounded-md text-white/20 hover:text-red-400 hover:bg-red-400/10 transition-colors"
             >
               <Trash2 size={14} />

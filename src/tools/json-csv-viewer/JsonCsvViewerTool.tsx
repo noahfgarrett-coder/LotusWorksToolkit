@@ -3,7 +3,7 @@ import { FileDropZone } from '@/components/common/FileDropZone.tsx'
 import { Button } from '@/components/common/Button.tsx'
 import { readFileAsText } from '@/utils/fileReader.ts'
 import { downloadText } from '@/utils/download.ts'
-import { Download, Search, ArrowUpDown, ArrowUp, ArrowDown, Copy, ChevronRight, ChevronDown } from 'lucide-react'
+import { Download, Search, ArrowUpDown, ArrowUp, ArrowDown, Copy, ChevronRight, ChevronDown, X } from 'lucide-react'
 
 type SortDir = 'asc' | 'desc' | null
 type ViewMode = 'table' | 'tree'
@@ -23,6 +23,7 @@ export default function JsonCsvViewerTool() {
   const [viewMode, setViewMode] = useState<ViewMode>('table')
   const [jsonTree, setJsonTree] = useState<unknown>(null)
   const [isNested, setIsNested] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
 
   const parseCSV = useCallback((text: string) => {
     const lines = text.trim().split('\n')
@@ -73,7 +74,17 @@ export default function JsonCsvViewerTool() {
     const file = files[0]
     if (!file) return
 
-    const text = await readFileAsText(file)
+    setLoadError(null)
+
+    let text: string
+    try {
+      text = await readFileAsText(file)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setLoadError(`Failed to read file: ${msg}`)
+      return
+    }
+
     setRawData(text)
     setFileName(file.name)
     setSearchQuery('')
@@ -101,6 +112,7 @@ export default function JsonCsvViewerTool() {
         setRows([])
         setJsonTree(null)
         setIsNested(false)
+        setLoadError('Invalid JSON — could not parse the file')
       }
     }
   }, [parseCSV, parseJSON])
@@ -165,21 +177,35 @@ export default function JsonCsvViewerTool() {
     )
   }
 
-  const handleCopyToClipboard = () => {
+  const handleCopyToClipboard = async () => {
     const data = sortedRows.length > 0 ? sortedRows : jsonTree
-    navigator.clipboard.writeText(JSON.stringify(data, null, 2))
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(data, null, 2))
+    } catch {
+      // Clipboard API may not be available
+    }
   }
 
   if (!fileName) {
     return (
-      <FileDropZone
-        onFiles={handleFiles}
-        accept=".json,.csv,.tsv"
-        multiple={false}
-        label="Drop a JSON or CSV file"
-        description="JSON, CSV, or TSV"
-        className="h-full"
-      />
+      <div className="h-full flex flex-col gap-4">
+        <FileDropZone
+          onFiles={handleFiles}
+          accept=".json,.csv,.tsv"
+          multiple={false}
+          label="Drop a JSON or CSV file"
+          description="JSON, CSV, or TSV"
+          className="h-full"
+        />
+        {loadError && (
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+            <p className="text-sm text-red-400 flex-1">{loadError}</p>
+            <button onClick={() => setLoadError(null)} className="p-1 rounded text-red-400/60 hover:text-red-400 transition-colors" aria-label="Dismiss error">
+              <X size={14} />
+            </button>
+          </div>
+        )}
+      </div>
     )
   }
 
@@ -403,6 +429,7 @@ function JsonTreeNode({ value, keyName, depth = 0 }: { value: unknown; keyName?:
         <button
           onClick={() => setExpanded(!expanded)}
           className="flex items-center gap-1 hover:text-white transition-colors text-white/70"
+          aria-label={expanded ? `Collapse array ${keyName ?? ''}` : `Expand array ${keyName ?? ''}`}
         >
           {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           {keyName !== undefined && <span className="text-[#F47B20]">"{keyName}":</span>}
@@ -426,6 +453,7 @@ function JsonTreeNode({ value, keyName, depth = 0 }: { value: unknown; keyName?:
         <button
           onClick={() => setExpanded(!expanded)}
           className="flex items-center gap-1 hover:text-white transition-colors text-white/70"
+          aria-label={expanded ? `Collapse object ${keyName ?? ''}` : `Expand object ${keyName ?? ''}`}
         >
           {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           {keyName !== undefined && <span className="text-[#F47B20]">"{keyName}":</span>}

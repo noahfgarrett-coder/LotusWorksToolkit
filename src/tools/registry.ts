@@ -6,8 +6,7 @@ export const tools: ToolDefinition[] = [
   { id: 'pdf-split', label: 'PDF Split', description: 'Extract pages from a PDF', category: 'documents', icon: 'Scissors' },
   { id: 'pdf-annotate', label: 'PDF Annotate', description: 'Draw, highlight, and annotate PDFs', category: 'documents', icon: 'PenTool' },
   { id: 'pdf-watermark', label: 'PDF Watermark', description: 'Add text or image watermarks', category: 'documents', icon: 'Stamp' },
-  { id: 'text-extract', label: 'Text Extract', description: 'Extract embedded text from PDFs', category: 'documents', icon: 'FileText' },
-  { id: 'ocr-extract', label: 'OCR Extract', description: 'Extract text from scanned PDFs', category: 'documents', icon: 'ScanText' },
+  { id: 'text-extract', label: 'Text Extract', description: 'Extract text and tables from PDFs — embedded text or OCR', category: 'documents', icon: 'FileText' },
 
   // Images
   { id: 'image-resizer', label: 'Image Resizer', description: 'Resize and compress images', category: 'images', icon: 'Maximize2' },

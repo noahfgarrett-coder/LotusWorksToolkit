@@ -74,12 +74,15 @@ export default function QrCodeTool() {
   const handleCopyToClipboard = async () => {
     if (!canvasRef.current) return
     try {
-      const blob = await new Promise<Blob>((resolve) => {
-        canvasRef.current!.toBlob((b) => b && resolve(b), 'image/png')
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvasRef.current!.toBlob((b) => {
+          if (b) resolve(b)
+          else reject(new Error('Failed to create image blob'))
+        }, 'image/png')
       })
       await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
     } catch {
-      // Clipboard API may not be available
+      // Clipboard API may not be available or blob creation failed
     }
   }
 

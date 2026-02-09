@@ -5,7 +5,7 @@ import { Slider } from '@/components/common/Slider.tsx'
 import { readFileAsDataURL, formatFileSize } from '@/utils/fileReader.ts'
 import { loadImage, resizeImage, canvasToBlob, removeBackgroundColor, getPixelColor } from '@/utils/imageProcessing.ts'
 import { downloadBlob } from '@/utils/download.ts'
-import { Download, Pipette, RotateCcw, Undo2, Image as ImageIcon, Eye, EyeOff } from 'lucide-react'
+import { Download, Pipette, RotateCcw, Undo2, Image as ImageIcon, Eye, EyeOff, X } from 'lucide-react'
 
 export default function BgRemoveTool() {
   const [imageFile, setImageFile] = useState<File | null>(null)
@@ -16,6 +16,7 @@ export default function BgRemoveTool() {
   const [isPickingColor, setIsPickingColor] = useState(false)
   const [outputBlob, setOutputBlob] = useState<Blob | null>(null)
   const [isProcessing, setIsProcessing] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const [showOriginal, setShowOriginal] = useState(false)
 
   const sourceCanvasRef = useRef<HTMLCanvasElement>(null)
@@ -44,18 +45,25 @@ export default function BgRemoveTool() {
     const file = files[0]
     if (!file) return
 
+    setError(null)
     setImageFile(file)
     setOutputBlob(null)
     setSelectedColor(null)
 
-    const dataUrl = await readFileAsDataURL(file)
-    setImageSrc(dataUrl)
+    try {
+      const dataUrl = await readFileAsDataURL(file)
+      setImageSrc(dataUrl)
 
-    const img = await loadImage(dataUrl)
-    setOriginalSize({ width: img.naturalWidth, height: img.naturalHeight })
+      const img = await loadImage(dataUrl)
+      setOriginalSize({ width: img.naturalWidth, height: img.naturalHeight })
 
-    await drawSourceImage(dataUrl)
-    setIsPickingColor(true)
+      await drawSourceImage(dataUrl)
+      setIsPickingColor(true)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setError(`Failed to load image: ${msg}`)
+      setImageFile(null)
+    }
   }, [drawSourceImage])
 
   // Redraw source when toggling original view
@@ -82,6 +90,7 @@ export default function BgRemoveTool() {
     if (!imageSrc || !selectedColor) return
 
     setIsProcessing(true)
+    setError(null)
     try {
       const img = await loadImage(imageSrc)
       // Work at full resolution
@@ -108,6 +117,9 @@ export default function BgRemoveTool() {
         // Draw result on top
         ctx.drawImage(canvas, 0, 0, previewCanvas.width, previewCanvas.height)
       }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setError(`Background removal failed: ${msg}`)
     } finally {
       setIsProcessing(false)
     }
@@ -131,14 +143,24 @@ export default function BgRemoveTool() {
 
   if (!imageFile) {
     return (
-      <FileDropZone
-        onFiles={handleFiles}
-        accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
-        multiple={false}
-        label="Drop an image here"
-        description="PNG, JPEG, WebP, GIF, or BMP"
-        className="h-full"
-      />
+      <div className="h-full flex flex-col gap-4">
+        <FileDropZone
+          onFiles={handleFiles}
+          accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
+          multiple={false}
+          label="Drop an image here"
+          description="PNG, JPEG, WebP, GIF, or BMP"
+          className="h-full"
+        />
+        {error && (
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+            <p className="text-sm text-red-400 flex-1">{error}</p>
+            <button onClick={() => setError(null)} className="p-1 rounded text-red-400/60 hover:text-red-400 transition-colors" aria-label="Dismiss error">
+              <X size={14} />
+            </button>
+          </div>
+        )}
+      </div>
     )
   }
 
@@ -206,6 +228,14 @@ export default function BgRemoveTool() {
 
         {/* Actions */}
         <div className="space-y-2 pt-2">
+          {error && (
+            <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-red-500/10 border border-red-500/20">
+              <p className="text-[11px] text-red-400 flex-1">{error}</p>
+              <button onClick={() => setError(null)} className="p-0.5 rounded text-red-400/60 hover:text-red-400" aria-label="Dismiss error">
+                <X size={12} />
+              </button>
+            </div>
+          )}
           <Button
             onClick={handleRemove}
             disabled={isProcessing || !selectedColor}

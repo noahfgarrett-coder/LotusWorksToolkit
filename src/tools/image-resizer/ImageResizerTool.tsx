@@ -5,7 +5,7 @@ import { Slider } from '@/components/common/Slider.tsx'
 import { readFileAsDataURL, formatFileSize } from '@/utils/fileReader.ts'
 import { loadImage, resizeImage, canvasToBlob } from '@/utils/imageProcessing.ts'
 import { downloadBlob } from '@/utils/download.ts'
-import { Download, Link2, Link2Off, RotateCcw, Image as ImageIcon } from 'lucide-react'
+import { Download, Link2, Link2Off, RotateCcw, Image as ImageIcon, X } from 'lucide-react'
 
 type OutputFormat = 'image/png' | 'image/jpeg' | 'image/webp'
 
@@ -26,6 +26,7 @@ export default function ImageResizerTool() {
   const [format, setFormat] = useState<OutputFormat>('image/png')
   const [outputBlob, setOutputBlob] = useState<Blob | null>(null)
   const [isProcessing, setIsProcessing] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const previewRef = useRef<HTMLCanvasElement>(null)
 
   const aspectRatio = originalSize.width / (originalSize.height || 1)
@@ -34,16 +35,23 @@ export default function ImageResizerTool() {
     const file = files[0]
     if (!file) return
 
+    setError(null)
     setImageFile(file)
     setOutputBlob(null)
 
-    const dataUrl = await readFileAsDataURL(file)
-    setImageSrc(dataUrl)
+    try {
+      const dataUrl = await readFileAsDataURL(file)
+      setImageSrc(dataUrl)
 
-    const img = await loadImage(dataUrl)
-    setOriginalSize({ width: img.naturalWidth, height: img.naturalHeight })
-    setWidth(img.naturalWidth)
-    setHeight(img.naturalHeight)
+      const img = await loadImage(dataUrl)
+      setOriginalSize({ width: img.naturalWidth, height: img.naturalHeight })
+      setWidth(img.naturalWidth)
+      setHeight(img.naturalHeight)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setError(`Failed to load image: ${msg}`)
+      setImageFile(null)
+    }
   }, [])
 
   const handleWidthChange = (newWidth: number) => {
@@ -64,6 +72,7 @@ export default function ImageResizerTool() {
     if (!imageSrc || width <= 0 || height <= 0) return
 
     setIsProcessing(true)
+    setError(null)
     try {
       const img = await loadImage(imageSrc)
       const canvas = resizeImage(img, width, height)
@@ -78,6 +87,9 @@ export default function ImageResizerTool() {
         previewRef.current.height = height * previewScale
         ctx.drawImage(canvas, 0, 0, previewRef.current.width, previewRef.current.height)
       }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setError(`Resize failed: ${msg}`)
     } finally {
       setIsProcessing(false)
     }
@@ -98,14 +110,24 @@ export default function ImageResizerTool() {
 
   if (!imageFile) {
     return (
-      <FileDropZone
-        onFiles={handleFiles}
-        accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
-        multiple={false}
-        label="Drop an image here"
-        description="PNG, JPEG, WebP, GIF, or BMP"
-        className="h-full"
-      />
+      <div className="h-full flex flex-col gap-4">
+        <FileDropZone
+          onFiles={handleFiles}
+          accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
+          multiple={false}
+          label="Drop an image here"
+          description="PNG, JPEG, WebP, GIF, or BMP"
+          className="h-full"
+        />
+        {error && (
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+            <p className="text-sm text-red-400 flex-1">{error}</p>
+            <button onClick={() => setError(null)} className="p-1 rounded text-red-400/60 hover:text-red-400 transition-colors" aria-label="Dismiss error">
+              <X size={14} />
+            </button>
+          </div>
+        )}
+      </div>
     )
   }
 
@@ -140,6 +162,7 @@ export default function ImageResizerTool() {
                 lockAspect ? 'text-[#F47B20] bg-[#F47B20]/10' : 'text-white/30 hover:text-white/60'
               }`}
               title={lockAspect ? 'Unlock aspect ratio' : 'Lock aspect ratio'}
+              aria-label={lockAspect ? 'Unlock aspect ratio' : 'Lock aspect ratio'}
             >
               {lockAspect ? <Link2 size={16} /> : <Link2Off size={16} />}
             </button>
@@ -211,6 +234,14 @@ export default function ImageResizerTool() {
 
         {/* Actions */}
         <div className="space-y-2 pt-2">
+          {error && (
+            <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-red-500/10 border border-red-500/20">
+              <p className="text-[11px] text-red-400 flex-1">{error}</p>
+              <button onClick={() => setError(null)} className="p-0.5 rounded text-red-400/60 hover:text-red-400" aria-label="Dismiss error">
+                <X size={12} />
+              </button>
+            </div>
+          )}
           <Button onClick={handleResize} disabled={isProcessing} className="w-full">
             {isProcessing ? 'Resizing...' : 'Resize'}
           </Button>

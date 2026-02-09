@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
 import { FileDropZone } from '@/components/common/FileDropZone.tsx'
 import { Button } from '@/components/common/Button.tsx'
 import { ProgressBar } from '@/components/common/ProgressBar.tsx'
-import { loadPDFFile, generateThumbnail, mergePDFs } from '@/utils/pdf.ts'
+import { loadPDFFile, generateThumbnail, mergePDFs, removePDFFromCache } from '@/utils/pdf.ts'
 import { downloadBlob } from '@/utils/download.ts'
 import { formatFileSize } from '@/utils/fileReader.ts'
 import type { PDFFile } from '@/types'
@@ -176,6 +176,7 @@ export default function PdfMergeTool() {
   const [files, setFiles] = useState<MergeFile[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [isMerging, setIsMerging] = useState(false)
+  const [mergeError, setMergeError] = useState<string | null>(null)
   const [progress, setProgress] = useState(0)
 
   // File-level drag state (native HTML5 DnD for file rows)
@@ -286,6 +287,7 @@ export default function PdfMergeTool() {
   }, [])
 
   const removeFile = (id: string) => {
+    removePDFFromCache(id)
     setFiles((prev) => prev.filter((f) => f.id !== id))
   }
 
@@ -458,6 +460,7 @@ export default function PdfMergeTool() {
   const handleMerge = useCallback(async () => {
     if (files.length < 1) return
     setIsMerging(true)
+    setMergeError(null)
     setProgress(0)
     try {
       const mergeInputs = files
@@ -500,6 +503,7 @@ export default function PdfMergeTool() {
       }
     } catch (err) {
       console.error('Merge failed:', err)
+      setMergeError(err instanceof Error ? err.message : 'Merge failed — check that all PDFs are valid')
     } finally {
       setIsMerging(false)
       setProgress(0)
@@ -636,6 +640,19 @@ export default function PdfMergeTool() {
         <ProgressBar value={progress} max={100} label="Merging PDFs..." />
       )}
 
+      {/* Merge error */}
+      {mergeError && (
+        <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/20 flex items-center gap-3 flex-shrink-0">
+          <span className="text-xs text-red-400">{mergeError}</span>
+          <button
+            onClick={() => setMergeError(null)}
+            className="ml-auto text-xs text-white/40 hover:text-white/70"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {/* File list */}
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto space-y-1.5" onClick={(e) => { if (e.target === e.currentTarget) setSelectedPage(null) }}>
         {files.map((file, idx) => (
@@ -696,6 +713,7 @@ export default function PdfMergeTool() {
                 <button
                   onClick={() => moveFile(idx, -1)}
                   disabled={idx === 0}
+                  aria-label={`Move ${file.name} up`}
                   className="p-1 rounded text-white/20 hover:text-white/60 disabled:opacity-20 disabled:pointer-events-none"
                 >
                   <ArrowUp size={12} />
@@ -703,6 +721,7 @@ export default function PdfMergeTool() {
                 <button
                   onClick={() => moveFile(idx, 1)}
                   disabled={idx === files.length - 1}
+                  aria-label={`Move ${file.name} down`}
                   className="p-1 rounded text-white/20 hover:text-white/60 disabled:opacity-20 disabled:pointer-events-none"
                 >
                   <ArrowDown size={12} />
@@ -712,6 +731,7 @@ export default function PdfMergeTool() {
               {/* Remove button */}
               <button
                 onClick={() => removeFile(file.id)}
+                aria-label={`Remove ${file.name}`}
                 className="p-1.5 rounded-md text-white/20 hover:text-red-400 hover:bg-red-400/10 transition-colors"
               >
                 <Trash2 size={14} />

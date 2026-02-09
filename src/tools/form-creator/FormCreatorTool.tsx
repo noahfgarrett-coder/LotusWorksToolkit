@@ -2,7 +2,7 @@ import { useState, useCallback } from 'react'
 import { Button } from '@/components/common/Button.tsx'
 import { downloadBlob } from '@/utils/download.ts'
 import { PDFDocument, rgb } from 'pdf-lib'
-import { Download, Plus, Trash2, GripVertical, ArrowUp, ArrowDown } from 'lucide-react'
+import { Download, Plus, Trash2, GripVertical, ArrowUp, ArrowDown, X } from 'lucide-react'
 
 type FieldType = 'text' | 'textarea' | 'checkbox' | 'radio' | 'date' | 'label' | 'signature'
 
@@ -87,6 +87,7 @@ export default function FormCreatorTool() {
   const [formTitle, setFormTitle] = useState('New Form')
   const [fields, setFields] = useState<FormField[]>([])
   const [isExporting, setIsExporting] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
 
   const addField = (type: FieldType) => {
     const fieldDef = FIELD_TYPES.find((f) => f.id === type)
@@ -297,7 +298,8 @@ export default function FormCreatorTool() {
       const blob = new Blob([pdfBytes], { type: 'application/pdf' })
       downloadBlob(blob, `${formTitle.replace(/\s+/g, '-').toLowerCase()}.pdf`)
     } catch (err) {
-      console.error('PDF export failed:', err)
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setExportError(`PDF export failed: ${msg}`)
     } finally {
       setIsExporting(false)
     }
@@ -341,7 +343,15 @@ export default function FormCreatorTool() {
         </div>
 
         {/* Export */}
-        <div className="pt-4">
+        <div className="pt-4 space-y-2">
+          {exportError && (
+            <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-red-500/10 border border-red-500/20">
+              <p className="text-[11px] text-red-400 flex-1">{exportError}</p>
+              <button onClick={() => setExportError(null)} className="p-0.5 rounded text-red-400/60 hover:text-red-400" aria-label="Dismiss error">
+                <X size={12} />
+              </button>
+            </div>
+          )}
           <Button
             onClick={handleExportPDF}
             disabled={fields.length === 0 || isExporting}
@@ -410,6 +420,7 @@ export default function FormCreatorTool() {
                               updateField(field.id, { options: newOpts })
                             }}
                             className="text-white/20 hover:text-red-400"
+                            aria-label="Remove option"
                           >
                             <Trash2 size={10} />
                           </button>
@@ -433,6 +444,7 @@ export default function FormCreatorTool() {
                     onClick={() => moveField(idx, -1)}
                     disabled={idx === 0}
                     className="p-1 text-white/20 hover:text-white/60 disabled:opacity-20"
+                    aria-label={`Move ${field.label} up`}
                   >
                     <ArrowUp size={12} />
                   </button>
@@ -440,12 +452,14 @@ export default function FormCreatorTool() {
                     onClick={() => moveField(idx, 1)}
                     disabled={idx === fields.length - 1}
                     className="p-1 text-white/20 hover:text-white/60 disabled:opacity-20"
+                    aria-label={`Move ${field.label} down`}
                   >
                     <ArrowDown size={12} />
                   </button>
                   <button
                     onClick={() => removeField(field.id)}
                     className="p-1 text-white/20 hover:text-red-400"
+                    aria-label={`Delete ${field.label}`}
                   >
                     <Trash2 size={12} />
                   </button>

@@ -4,10 +4,39 @@ import { Button } from '@/components/common/Button.tsx'
 import { Slider } from '@/components/common/Slider.tsx'
 import { loadPDFFile, renderPageToCanvas } from '@/utils/pdf.ts'
 import { downloadBlob } from '@/utils/download.ts'
-import { formatFileSize } from '@/utils/fileReader.ts'
+import { formatFileSize, readFileAsDataURL, readFileAsUint8Array } from '@/utils/fileReader.ts'
+import { loadImage } from '@/utils/imageProcessing.ts'
 import type { PDFFile } from '@/types'
 import { PDFDocument, rgb, degrees } from 'pdf-lib'
-import { Download, RotateCcw, Type, Image as ImageIcon, Move } from 'lucide-react'
+import { Download, RotateCcw, Type, Image as ImageIcon, Move, Upload, X } from 'lucide-react'
+
+/** Typed wrapper around the File System Access API — eliminates `any` casts */
+interface PickerHandle {
+  createWritable(): Promise<{ write(d: Blob): Promise<void>; close(): Promise<void> }>
+}
+type PickerFn = (opts: {
+  suggestedName: string
+  types: Array<{ description: string; accept: Record<string, string[]> }>
+}) => Promise<PickerHandle>
+
+async function saveWithPicker(
+  blob: Blob,
+  suggestedName: string,
+  fileType: { description: string; accept: Record<string, string[]> },
+): Promise<'saved' | 'fallback' | 'cancelled'> {
+  if (!('showSaveFilePicker' in window)) return 'fallback'
+  try {
+    const picker = (window as unknown as { showSaveFilePicker: PickerFn }).showSaveFilePicker
+    const handle = await picker({ suggestedName, types: [fileType] })
+    const writable = await handle.createWritable()
+    await writable.write(blob)
+    await writable.close()
+    return 'saved'
+  } catch (e: unknown) {
+    if (e instanceof DOMException && e.name === 'AbortError') return 'cancelled'
+    return 'fallback'
+  }
+}
 
 type WatermarkType = 'text' | 'image'
 type Position = 'center' | 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' | 'tile'
@@ -31,11 +60,24 @@ export default function WatermarkTool() {
   const [position, setPosition] = useState<Position>('center')
   const [color, setColor] = useState('#888888')
   const [isProcessing, setIsProcessing] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [applyError, setApplyError] = useState<string | null>(null)
   const [previewPage, setPreviewPage] = useState(1)
+
+  // Image watermark
+  const [watermarkImage, setWatermarkImage] = useState<{
+    element: HTMLImageElement
+    bytes: Uint8Array
+    name: string
+    type: 'png' | 'jpg'
+  } | null>(null)
+  const [imageScale, setImageScale] = useState(25)
+  const imageInputRef = useRef<HTMLInputElement>(null)
 
   // Custom position offset (relative to preset position, in normalized 0-1 coords)
   const [customOffset, setCustomOffset] = useState<{ x: number; y: number } | null>(null)
 
+  const [pdfRendered, setPdfRendered] = useState(0)
   const previewCanvasRef = useRef<HTMLCanvasElement>(null)
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null)
   const isDraggingRef = useRef(false)
@@ -44,10 +86,33 @@ export default function WatermarkTool() {
   const handleFiles = useCallback(async (files: File[]) => {
     const file = files[0]
     if (!file) return
-    const pdf = await loadPDFFile(file)
-    setPdfFile(pdf)
-    setPreviewPage(1)
-    setCustomOffset(null)
+    setLoadError(null)
+    try {
+      const pdf = await loadPDFFile(file)
+      setPdfFile(pdf)
+      setPreviewPage(1)
+      setCustomOffset(null)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setLoadError(`Failed to load PDF: ${msg}`)
+    }
+  }, [])
+
+  const handleImageUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    try {
+      const dataUrl = await readFileAsDataURL(file)
+      const element = await loadImage(dataUrl)
+      const bytes = await readFileAsUint8Array(file)
+      const isPng = file.type === 'image/png' || file.name.toLowerCase().endsWith('.png')
+      setWatermarkImage({ element, bytes, name: file.name, type: isPng ? 'png' : 'jpg' })
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setLoadError(`Failed to load image: ${msg}`)
+    }
+    // Reset input so the same file can be re-selected
+    e.target.value = ''
   }, [])
 
   // Get watermark position in canvas coordinates
@@ -67,14 +132,21 @@ export default function WatermarkTool() {
     if (!pdfFile || !previewCanvasRef.current) return
 
     const renderPdf = async () => {
-      const canvas = previewCanvasRef.current!
-      await renderPageToCanvas(pdfFile, previewPage, canvas, 1.0)
+      try {
+        const canvas = previewCanvasRef.current!
+        await renderPageToCanvas(pdfFile, previewPage, canvas, 1.0)
 
-      // Size overlay to match
-      const overlay = overlayCanvasRef.current
-      if (overlay && (overlay.width !== canvas.width || overlay.height !== canvas.height)) {
-        overlay.width = canvas.width
-        overlay.height = canvas.height
+        // Size overlay to match
+        const overlay = overlayCanvasRef.current
+        if (overlay && (overlay.width !== canvas.width || overlay.height !== canvas.height)) {
+          overlay.width = canvas.width
+          overlay.height = canvas.height
+        }
+
+        // Signal that canvas is ready so the overlay effect can redraw
+        setPdfRendered(c => c + 1)
+      } catch {
+        // Page render can fail if the PDF is corrupt or the component unmounted
       }
     }
 
@@ -98,8 +170,10 @@ export default function WatermarkTool() {
 
     if (watermarkType === 'text' && text.trim()) {
       drawTextWatermark(ctx, overlay.width, overlay.height)
+    } else if (watermarkType === 'image' && watermarkImage) {
+      drawImageWatermark(ctx, overlay.width, overlay.height)
     }
-  }, [pdfFile, previewPage, text, fontSize, opacity, rotation, position, color, watermarkType, customOffset])
+  }, [pdfFile, previewPage, pdfRendered, text, fontSize, opacity, rotation, position, color, watermarkType, customOffset, watermarkImage, imageScale])
 
   const drawTextWatermark = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
     ctx.globalAlpha = opacity / 100
@@ -109,13 +183,34 @@ export default function WatermarkTool() {
     ctx.textBaseline = 'middle'
 
     if (position === 'tile') {
-      const spacing = fontSize * 4
-      for (let y = -h; y < h * 2; y += spacing) {
-        for (let x = -w; x < w * 2; x += spacing) {
+      // Wrap text and measure actual bounding box for tile spacing
+      const margin = fontSize * 2
+      const maxLineWidth = w - margin * 2
+      const lines = wrapTextToWidth(text, maxLineWidth, (t) => ctx.measureText(t).width)
+      const lineHeight = fontSize * 1.3
+      const textBlockH = lines.length * lineHeight
+      const textBlockW = Math.max(...lines.map(l => ctx.measureText(l).width))
+
+      // Account for rotation when computing tile cell size
+      const rad = Math.abs(rotation * Math.PI / 180)
+      const cos = Math.cos(rad), sin = Math.sin(rad)
+      const rotatedW = textBlockW * cos + textBlockH * sin
+      const rotatedH = textBlockW * sin + textBlockH * cos
+
+      // Spacing = rotated bounding box + padding (at least fontSize gap between tiles)
+      const pad = fontSize * 1.5
+      const spacingX = Math.max(rotatedW + pad, fontSize * 2)
+      const spacingY = Math.max(rotatedH + pad, fontSize * 2)
+
+      for (let ty = -h; ty < h * 2; ty += spacingY) {
+        for (let tx = -w; tx < w * 2; tx += spacingX) {
           ctx.save()
-          ctx.translate(x, y)
+          ctx.translate(tx, ty)
           ctx.rotate((rotation * Math.PI) / 180)
-          ctx.fillText(text, 0, 0)
+          const startY = -textBlockH / 2 + lineHeight / 2
+          for (let i = 0; i < lines.length; i++) {
+            ctx.fillText(lines[i], 0, startY + i * lineHeight)
+          }
           ctx.restore()
         }
       }
@@ -134,6 +229,43 @@ export default function WatermarkTool() {
       for (let i = 0; i < lines.length; i++) {
         ctx.fillText(lines[i], 0, startY + i * lineHeight)
       }
+      ctx.restore()
+    }
+  }
+
+  const drawImageWatermark = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
+    if (!watermarkImage) return
+    const { element } = watermarkImage
+    const imgW = (imageScale / 100) * w
+    const imgH = imgW * (element.naturalHeight / element.naturalWidth)
+
+    ctx.globalAlpha = opacity / 100
+
+    if (position === 'tile') {
+      // Rotation-aware tile spacing
+      const rad = Math.abs(rotation * Math.PI / 180)
+      const cos = Math.cos(rad), sin = Math.sin(rad)
+      const rotatedW = imgW * cos + imgH * sin
+      const rotatedH = imgW * sin + imgH * cos
+      const pad = Math.max(imgW, imgH) * 0.3
+      const spacingX = Math.max(rotatedW + pad, imgW * 0.5)
+      const spacingY = Math.max(rotatedH + pad, imgH * 0.5)
+
+      for (let ty = -h; ty < h * 2; ty += spacingY) {
+        for (let tx = -w; tx < w * 2; tx += spacingX) {
+          ctx.save()
+          ctx.translate(tx, ty)
+          ctx.rotate((rotation * Math.PI) / 180)
+          ctx.drawImage(element, -imgW / 2, -imgH / 2, imgW, imgH)
+          ctx.restore()
+        }
+      }
+    } else {
+      const pos = getWatermarkPos(w, h)
+      ctx.save()
+      ctx.translate(pos.x, pos.y)
+      ctx.rotate((rotation * Math.PI) / 180)
+      ctx.drawImage(element, -imgW / 2, -imgH / 2, imgW, imgH)
       ctx.restore()
     }
   }
@@ -190,27 +322,75 @@ export default function WatermarkTool() {
   }, [])
 
   const handleApply = useCallback(async () => {
-    if (!pdfFile || !text.trim()) return
+    if (!pdfFile) return
+    if (watermarkType === 'text' && !text.trim()) return
+    if (watermarkType === 'image' && !watermarkImage) return
 
     setIsProcessing(true)
+    setApplyError(null)
     try {
       const doc = await PDFDocument.load(pdfFile.data)
       const pages = doc.getPages()
 
-      const r = parseInt(color.slice(1, 3), 16) / 255
-      const g = parseInt(color.slice(3, 5), 16) / 255
-      const b = parseInt(color.slice(5, 7), 16) / 255
+      if (watermarkType === 'text') {
+        const r = parseInt(color.slice(1, 3), 16) / 255
+        const g = parseInt(color.slice(3, 5), 16) / 255
+        const b = parseInt(color.slice(5, 7), 16) / 255
 
-      for (const page of pages) {
-        const { width, height } = page.getSize()
+        for (const page of pages) {
+          const { width, height } = page.getSize()
 
-        if (position === 'tile') {
-          const spacing = fontSize * 4
-          for (let y = 0; y < height; y += spacing) {
-            for (let x = 0; x < width; x += spacing) {
-              page.drawText(text, {
-                x,
-                y,
+          if (position === 'tile') {
+            const margin = fontSize * 2
+            const maxLineWidth = width - margin * 2
+            const measureFn = (t: string) => t.length * fontSize * 0.5
+            const lines = wrapTextToWidth(text, maxLineWidth, measureFn)
+            const lineHeight = fontSize * 1.3
+            const textBlockH = lines.length * lineHeight
+            const textBlockW = Math.max(...lines.map(l => measureFn(l)))
+
+            const rad = Math.abs(rotation * Math.PI / 180)
+            const cos = Math.cos(rad), sin = Math.sin(rad)
+            const rotatedW = textBlockW * cos + textBlockH * sin
+            const rotatedH = textBlockW * sin + textBlockH * cos
+
+            const pad = fontSize * 1.5
+            const spacingX = Math.max(rotatedW + pad, fontSize * 2)
+            const spacingY = Math.max(rotatedH + pad, fontSize * 2)
+
+            for (let ty = -height; ty < height * 2; ty += spacingY) {
+              for (let tx = -width; tx < width * 2; tx += spacingX) {
+                const startY = -textBlockH / 2 + lineHeight / 2
+                for (let i = 0; i < lines.length; i++) {
+                  const lineW = measureFn(lines[i])
+                  page.drawText(lines[i], {
+                    x: tx - lineW / 2,
+                    y: ty + (startY + i * lineHeight),
+                    size: fontSize,
+                    color: rgb(r, g, b),
+                    opacity: opacity / 100,
+                    rotate: degrees(rotation),
+                  })
+                }
+              }
+            }
+          } else {
+            const canvasPos = getWatermarkPos(width, height)
+            const margin = fontSize * 2
+            const maxWidth = width - margin * 2
+            const measureFn = (t: string) => t.length * fontSize * 0.5
+            const lines = wrapTextToWidth(text, maxWidth, measureFn)
+            const lineHeight = fontSize * 1.3
+            const totalHeight = lines.length * lineHeight
+
+            const pdfCenterY = height - canvasPos.y
+
+            const startY = pdfCenterY + totalHeight / 2 - lineHeight / 2
+            for (let i = 0; i < lines.length; i++) {
+              const lineWidth = measureFn(lines[i])
+              page.drawText(lines[i], {
+                x: canvasPos.x - lineWidth / 2,
+                y: startY - i * lineHeight,
                 size: fontSize,
                 color: rgb(r, g, b),
                 opacity: opacity / 100,
@@ -218,31 +398,49 @@ export default function WatermarkTool() {
               })
             }
           }
-        } else {
-          // Get canvas-style position, then convert to PDF coordinates
-          const canvasPos = getWatermarkPos(width, height)
-          const margin = fontSize * 2
-          const maxWidth = width - margin * 2
-          const measureFn = (t: string) => t.length * fontSize * 0.5
-          const lines = wrapTextToWidth(text, maxWidth, measureFn)
-          const lineHeight = fontSize * 1.3
-          const totalHeight = lines.length * lineHeight
+        }
+      } else if (watermarkType === 'image' && watermarkImage) {
+        // Embed image once, draw on every page
+        const pdfImage = watermarkImage.type === 'png'
+          ? await doc.embedPng(watermarkImage.bytes)
+          : await doc.embedJpg(watermarkImage.bytes)
 
-          // Convert canvas Y (top-down) to PDF Y (bottom-up)
-          // In canvas: pos.y is from top. In PDF: y is from bottom
-          const pdfCenterY = height - canvasPos.y
+        for (const page of pages) {
+          const { width, height } = page.getSize()
+          const imgW = (imageScale / 100) * width
+          const imgH = imgW * (pdfImage.height / pdfImage.width)
 
-          // Draw each line centered around the position
-          const startY = pdfCenterY + totalHeight / 2 - lineHeight / 2
-          for (let i = 0; i < lines.length; i++) {
-            const lineWidth = measureFn(lines[i])
-            page.drawText(lines[i], {
-              x: canvasPos.x - lineWidth / 2,
-              y: startY - i * lineHeight,
-              size: fontSize,
-              color: rgb(r, g, b),
-              opacity: opacity / 100,
+          if (position === 'tile') {
+            const rad = Math.abs(rotation * Math.PI / 180)
+            const cos = Math.cos(rad), sin = Math.sin(rad)
+            const rotatedW = imgW * cos + imgH * sin
+            const rotatedH = imgW * sin + imgH * cos
+            const pad = Math.max(imgW, imgH) * 0.3
+            const spacingX = Math.max(rotatedW + pad, imgW * 0.5)
+            const spacingY = Math.max(rotatedH + pad, imgH * 0.5)
+
+            for (let ty = -height; ty < height * 2; ty += spacingY) {
+              for (let tx = -width; tx < width * 2; tx += spacingX) {
+                page.drawImage(pdfImage, {
+                  x: tx - imgW / 2,
+                  y: ty - imgH / 2,
+                  width: imgW,
+                  height: imgH,
+                  rotate: degrees(rotation),
+                  opacity: opacity / 100,
+                })
+              }
+            }
+          } else {
+            const canvasPos = getWatermarkPos(width, height)
+            const pdfCenterY = height - canvasPos.y
+            page.drawImage(pdfImage, {
+              x: canvasPos.x - imgW / 2,
+              y: pdfCenterY - imgH / 2,
+              width: imgW,
+              height: imgH,
               rotate: degrees(rotation),
+              opacity: opacity / 100,
             })
           }
         }
@@ -252,31 +450,19 @@ export default function WatermarkTool() {
       const blob = new Blob([pdfBytes], { type: 'application/pdf' })
       const baseName = pdfFile.name.replace(/\.pdf$/i, '')
 
-      let saved = false
-      if ('showSaveFilePicker' in window) {
-        try {
-          const handle = await (window as any).showSaveFilePicker({
-            suggestedName: `${baseName}-watermarked.pdf`,
-            types: [{ description: 'PDF Document', accept: { 'application/pdf': ['.pdf'] } }],
-          })
-          const writable = await handle.createWritable()
-          await writable.write(blob)
-          await writable.close()
-          saved = true
-        } catch (e: any) {
-          if (e?.name === 'AbortError') {
-            setIsProcessing(false)
-            return
-          }
-        }
-      }
-      if (!saved) downloadBlob(blob, `${baseName}-watermarked.pdf`)
+      const fileName = `${baseName}-watermarked.pdf`
+      const pickerResult = await saveWithPicker(blob, fileName, {
+        description: 'PDF Document', accept: { 'application/pdf': ['.pdf'] },
+      })
+      if (pickerResult === 'cancelled') return
+      if (pickerResult === 'fallback') downloadBlob(blob, fileName)
     } catch (err) {
-      console.error('Watermark failed:', err)
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setApplyError(`Watermark failed: ${msg}`)
     } finally {
       setIsProcessing(false)
     }
-  }, [pdfFile, text, fontSize, opacity, rotation, position, color, customOffset, getWatermarkPos])
+  }, [pdfFile, watermarkType, text, fontSize, opacity, rotation, position, color, customOffset, getWatermarkPos, watermarkImage, imageScale])
 
   // Reset custom offset when position preset changes
   const handlePositionChange = (newPosition: Position) => {
@@ -286,14 +472,24 @@ export default function WatermarkTool() {
 
   if (!pdfFile) {
     return (
-      <FileDropZone
-        onFiles={handleFiles}
-        accept="application/pdf"
-        multiple={false}
-        label="Drop a PDF file here"
-        description="Add text watermarks to your PDF"
-        className="h-full"
-      />
+      <div className="h-full flex flex-col gap-4">
+        <FileDropZone
+          onFiles={handleFiles}
+          accept="application/pdf"
+          multiple={false}
+          label="Drop a PDF file here"
+          description="Add text or image watermarks to your PDF"
+          className="h-full"
+        />
+        {loadError && (
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+            <p className="text-sm text-red-400 flex-1">{loadError}</p>
+            <button onClick={() => setLoadError(null)} className="p-1 rounded text-red-400/60 hover:text-red-400 transition-colors" aria-label="Dismiss error">
+              <X size={14} />
+            </button>
+          </div>
+        )}
+      </div>
     )
   }
 
@@ -325,9 +521,11 @@ export default function WatermarkTool() {
             </button>
             <button
               onClick={() => setWatermarkType('image')}
-              disabled
-              className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs rounded-md bg-white/[0.06] text-white/20 cursor-not-allowed"
-              title="Coming soon"
+              className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs rounded-md transition-colors ${
+                watermarkType === 'image'
+                  ? 'bg-[#F47B20] text-white'
+                  : 'bg-white/[0.06] text-white/50 hover:text-white'
+              }`}
             >
               <ImageIcon size={12} /> Image
             </button>
@@ -348,16 +546,80 @@ export default function WatermarkTool() {
           </div>
         )}
 
-        {/* Font size */}
-        <Slider
-          label="Font Size"
-          value={fontSize}
-          min={12}
-          max={120}
-          step={2}
-          suffix="px"
-          onChange={(e) => setFontSize(Number((e.target as HTMLInputElement).value))}
-        />
+        {/* Image upload */}
+        {watermarkType === 'image' && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-white/70 block">Image</label>
+            <input
+              ref={imageInputRef}
+              type="file"
+              accept="image/png,image/jpeg"
+              onChange={handleImageUpload}
+              className="hidden"
+            />
+            {watermarkImage ? (
+              <div className="flex items-center gap-2 p-2 rounded-lg bg-white/[0.04] border border-white/[0.06]">
+                <img
+                  src={watermarkImage.element.src}
+                  alt="Watermark"
+                  className="w-10 h-10 object-contain rounded bg-white/[0.08]"
+                />
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs text-white truncate">{watermarkImage.name}</p>
+                  <p className="text-[10px] text-white/40">
+                    {watermarkImage.element.naturalWidth} × {watermarkImage.element.naturalHeight}
+                  </p>
+                </div>
+                <button
+                  onClick={() => setWatermarkImage(null)}
+                  className="p-1 rounded text-white/30 hover:text-white hover:bg-white/[0.08] transition-colors"
+                  title="Remove image"
+                  aria-label="Remove watermark image"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => imageInputRef.current?.click()}
+                className="w-full flex items-center justify-center gap-2 px-3 py-3 text-xs text-white/50 hover:text-white rounded-lg border border-dashed border-white/[0.12] hover:border-white/[0.25] bg-white/[0.02] hover:bg-white/[0.04] transition-colors"
+              >
+                <Upload size={14} /> Upload PNG or JPG
+              </button>
+            )}
+            {watermarkImage && (
+              <button
+                onClick={() => imageInputRef.current?.click()}
+                className="text-[10px] text-[#F47B20] hover:text-[#F47B20]/80 transition-colors"
+              >
+                Change image
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Font size (text) / Scale (image) */}
+        {watermarkType === 'text' ? (
+          <Slider
+            label="Font Size"
+            value={fontSize}
+            min={12}
+            max={120}
+            step={2}
+            suffix="px"
+            onChange={(e) => setFontSize(Number((e.target as HTMLInputElement).value))}
+          />
+        ) : (
+          <Slider
+            label="Scale"
+            value={imageScale}
+            min={5}
+            max={100}
+            step={1}
+            suffix="%"
+            onChange={(e) => setImageScale(Number((e.target as HTMLInputElement).value))}
+          />
+        )}
 
         {/* Opacity */}
         <Slider
@@ -381,31 +643,33 @@ export default function WatermarkTool() {
           onChange={(e) => setRotation(Number((e.target as HTMLInputElement).value))}
         />
 
-        {/* Color */}
-        <div className="space-y-1.5">
-          <label className="text-xs font-medium text-white/70 block">Color</label>
-          <div className="flex items-center gap-2">
-            <label
-              className="w-8 h-8 rounded-lg border border-white/[0.12] cursor-pointer flex-shrink-0"
-              style={{ backgroundColor: color }}
-            >
+        {/* Color (text only) */}
+        {watermarkType === 'text' && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-white/70 block">Color</label>
+            <div className="flex items-center gap-2">
+              <label
+                className="w-8 h-8 rounded-lg border border-white/[0.12] cursor-pointer flex-shrink-0"
+                style={{ backgroundColor: color }}
+              >
+                <input
+                  type="color"
+                  value={color}
+                  onChange={(e) => setColor(e.target.value)}
+                  className="opacity-0 w-0 h-0"
+                />
+              </label>
               <input
-                type="color"
+                type="text"
                 value={color}
-                onChange={(e) => setColor(e.target.value)}
-                className="opacity-0 w-0 h-0"
+                onChange={(e) => {
+                  if (/^#[0-9a-fA-F]{0,6}$/.test(e.target.value)) setColor(e.target.value)
+                }}
+                className="flex-1 px-2 py-1 text-xs bg-dark-surface border border-white/[0.1] rounded-md text-white focus:outline-none focus:border-[#F47B20]/40"
               />
-            </label>
-            <input
-              type="text"
-              value={color}
-              onChange={(e) => {
-                if (/^#[0-9a-fA-F]{0,6}$/.test(e.target.value)) setColor(e.target.value)
-              }}
-              className="flex-1 px-2 py-1 text-xs bg-dark-surface border border-white/[0.1] rounded-md text-white focus:outline-none focus:border-[#F47B20]/40"
-            />
+            </div>
           </div>
-        </div>
+        )}
 
         {/* Position */}
         <div className="space-y-1.5">
@@ -434,7 +698,15 @@ export default function WatermarkTool() {
 
         {/* Actions */}
         <div className="space-y-2 pt-2">
-          <Button onClick={handleApply} disabled={isProcessing || !text.trim()} className="w-full">
+          {applyError && (
+            <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-red-500/10 border border-red-500/20">
+              <p className="text-[11px] text-red-400 flex-1">{applyError}</p>
+              <button onClick={() => setApplyError(null)} className="p-0.5 rounded text-red-400/60 hover:text-red-400" aria-label="Dismiss error">
+                <X size={12} />
+              </button>
+            </div>
+          )}
+          <Button onClick={handleApply} disabled={isProcessing || (watermarkType === 'text' ? !text.trim() : !watermarkImage)} className="w-full">
             {isProcessing ? 'Applying...' : 'Apply & Download'}
           </Button>
           <Button

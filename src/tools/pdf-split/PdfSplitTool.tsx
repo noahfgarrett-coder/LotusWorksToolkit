@@ -42,6 +42,34 @@ function makeDocId(): string { return `doc-${++_uid}` }
 
 const DOC_COLORS = ['#F47B20', '#3B82F6', '#22C55E', '#A855F7', '#EC4899', '#14B8A6', '#F59E0B', '#6366F1']
 
+/** Typed wrapper around the File System Access API — eliminates `any` casts */
+interface PickerHandle {
+  createWritable(): Promise<{ write(d: Blob): Promise<void>; close(): Promise<void> }>
+}
+type PickerFn = (opts: {
+  suggestedName: string
+  types: Array<{ description: string; accept: Record<string, string[]> }>
+}) => Promise<PickerHandle>
+
+async function saveWithPicker(
+  blob: Blob,
+  suggestedName: string,
+  fileType: { description: string; accept: Record<string, string[]> },
+): Promise<'saved' | 'fallback' | 'cancelled'> {
+  if (!('showSaveFilePicker' in window)) return 'fallback'
+  try {
+    const picker = (window as unknown as { showSaveFilePicker: PickerFn }).showSaveFilePicker
+    const handle = await picker({ suggestedName, types: [fileType] })
+    const writable = await handle.createWritable()
+    await writable.write(blob)
+    await writable.close()
+    return 'saved'
+  } catch (e: unknown) {
+    if (e instanceof DOMException && e.name === 'AbortError') return 'cancelled'
+    return 'fallback'
+  }
+}
+
 const RES_LEVELS = [
   { label: 'Low', height: 150 },
   { label: 'Med', height: 300 },
@@ -190,6 +218,7 @@ function SortablePageChip({ uid, pageNumber, docColor, onRemove, isActiveDoc }: 
         <button
           onClick={(e) => { e.stopPropagation(); onRemove() }}
           className="p-0.5 rounded text-white/0 group-hover/chip:text-white/40 hover:!text-red-400 transition-colors"
+          aria-label={`Remove page ${pageNumber}`}
         >
           <X size={8} />
         </button>
@@ -209,6 +238,8 @@ export default function PdfSplitTool() {
   const [activeDocId, setActiveDocId] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [exportError, setExportError] = useState<string | null>(null)
   const [progress, setProgress] = useState(0)
   const [editingDocId, setEditingDocId] = useState<string | null>(null)
   const [editingName, setEditingName] = useState('')
@@ -282,6 +313,7 @@ export default function PdfSplitTool() {
     if (!file) return
 
     setIsLoading(true)
+    setLoadError(null)
     setProgress(0)
     try {
       const pdf = await loadPDFFile(file)
@@ -307,7 +339,8 @@ export default function PdfSplitTool() {
       setActiveDocId(firstDocId)
       setDocCounter(1)
     } catch (err) {
-      console.error('Failed to load PDF:', err)
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setLoadError(`Failed to load PDF: ${msg}`)
     } finally {
       setIsLoading(false)
     }
@@ -511,6 +544,7 @@ export default function PdfSplitTool() {
     if (docsWithPages.length === 0) return
 
     setIsExporting(true)
+    setExportError(null)
     setProgress(0)
 
     try {
@@ -528,22 +562,11 @@ export default function PdfSplitTool() {
         const blob = new Blob([result], { type: 'application/pdf' })
         const fileName = doc.name.endsWith('.pdf') ? doc.name : `${doc.name}.pdf`
 
-        let saved = false
-        if ('showSaveFilePicker' in window) {
-          try {
-            const handle = await (window as any).showSaveFilePicker({
-              suggestedName: fileName,
-              types: [{ description: 'PDF Document', accept: { 'application/pdf': ['.pdf'] } }],
-            })
-            const writable = await handle.createWritable()
-            await writable.write(blob)
-            await writable.close()
-            saved = true
-          } catch (e: any) {
-            if (e?.name === 'AbortError') return  // user cancelled
-          }
-        }
-        if (!saved) downloadBlob(blob, fileName)
+        const pickerResult = await saveWithPicker(blob, fileName, {
+          description: 'PDF Document', accept: { 'application/pdf': ['.pdf'] },
+        })
+        if (pickerResult === 'cancelled') return
+        if (pickerResult === 'fallback') downloadBlob(blob, fileName)
       } else {
         const zip = new JSZip()
 
@@ -569,25 +592,15 @@ export default function PdfSplitTool() {
         const baseName = pdfFile.name.replace(/\.pdf$/i, '')
         const zipName = `${baseName}-split.zip`
 
-        let savedZip = false
-        if ('showSaveFilePicker' in window) {
-          try {
-            const handle = await (window as any).showSaveFilePicker({
-              suggestedName: zipName,
-              types: [{ description: 'ZIP Archive', accept: { 'application/zip': ['.zip'] } }],
-            })
-            const writable = await handle.createWritable()
-            await writable.write(zipBlob)
-            await writable.close()
-            savedZip = true
-          } catch (e: any) {
-            if (e?.name === 'AbortError') return  // user cancelled
-          }
-        }
-        if (!savedZip) downloadBlob(zipBlob, zipName)
+        const pickerResult = await saveWithPicker(zipBlob, zipName, {
+          description: 'ZIP Archive', accept: { 'application/zip': ['.zip'] },
+        })
+        if (pickerResult === 'cancelled') return
+        if (pickerResult === 'fallback') downloadBlob(zipBlob, zipName)
       }
     } catch (err) {
-      console.error('Export failed:', err)
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setExportError(`Export failed: ${msg}`)
     } finally {
       setIsExporting(false)
       setProgress(0)
@@ -644,6 +657,18 @@ export default function PdfSplitTool() {
         {isLoading && (
           <ProgressBar value={progress} max={100} label="Loading PDF..." />
         )}
+        {loadError && (
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
+            <p className="text-sm text-red-400 flex-1">{loadError}</p>
+            <button
+              onClick={() => setLoadError(null)}
+              className="p-1 rounded text-red-400/60 hover:text-red-400 transition-colors"
+              aria-label="Dismiss error"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
       </div>
     )
   }
@@ -680,6 +705,7 @@ export default function PdfSplitTool() {
               disabled={zoomCols >= MAX_COLS}
               className="p-1 rounded text-white/30 hover:text-white/70 disabled:opacity-20 disabled:pointer-events-none transition-colors"
               title="Zoom out (more columns)"
+              aria-label="Zoom out"
             >
               <ZoomOut size={14} />
             </button>
@@ -689,6 +715,7 @@ export default function PdfSplitTool() {
               disabled={zoomCols <= MIN_COLS}
               className="p-1 rounded text-white/30 hover:text-white/70 disabled:opacity-20 disabled:pointer-events-none transition-colors"
               title="Zoom in (fewer columns)"
+              aria-label="Zoom in"
             >
               <ZoomIn size={14} />
             </button>
@@ -786,7 +813,7 @@ export default function PdfSplitTool() {
                           onBlur={commitRename}
                           className="flex-1 min-w-0 text-xs bg-transparent border-b border-[#F47B20]/40 text-white outline-none px-0 py-0.5"
                         />
-                        <button type="submit" className="p-0.5 text-[#F47B20]">
+                        <button type="submit" className="p-0.5 text-[#F47B20]" aria-label="Confirm rename">
                           <Check size={10} />
                         </button>
                       </form>
@@ -811,6 +838,7 @@ export default function PdfSplitTool() {
                         onClick={() => editDocument(doc.id)}
                         className="p-0.5 rounded text-white/30 hover:text-[#F47B20] transition-colors flex-shrink-0"
                         title="Edit this document"
+                        aria-label={`Edit ${doc.name}`}
                       >
                         <Unlock size={11} />
                       </button>
@@ -824,6 +852,7 @@ export default function PdfSplitTool() {
                       onClick={() => deleteDocument(doc.id)}
                       className="p-0.5 rounded text-white/20 hover:text-red-400 transition-colors flex-shrink-0"
                       title="Delete document"
+                      aria-label={`Delete ${doc.name}`}
                     >
                       <Trash2 size={11} />
                     </button>
@@ -909,6 +938,19 @@ export default function PdfSplitTool() {
           >
             New Document
           </Button>
+
+          {exportError && (
+            <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-red-500/10 border border-red-500/20">
+              <p className="text-[11px] text-red-400 flex-1">{exportError}</p>
+              <button
+                onClick={() => setExportError(null)}
+                className="p-0.5 rounded text-red-400/60 hover:text-red-400 transition-colors"
+                aria-label="Dismiss error"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          )}
 
           {docsWithPages > 0 && (
             <>

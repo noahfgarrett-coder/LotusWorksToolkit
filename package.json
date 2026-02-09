@@ -19,6 +19,7 @@
     "html2canvas": "^1.4.1",
     "jszip": "^3.10.1",
     "lucide-react": "^0.400.0",
+    "marked": "^17.0.1",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^4.0.379",
     "perfect-freehand": "^1.2.2",
