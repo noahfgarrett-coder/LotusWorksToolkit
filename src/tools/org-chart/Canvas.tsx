@@ -848,19 +848,12 @@ function drawNodeCard(
   }
   ctx.stroke()
 
-  // Top accent bar
+  // Top accent bar (clipped to card shape so corners don't poke out)
   ctx.save()
-  ctx.beginPath()
-  ctx.moveTo(radius, 0)
-  ctx.lineTo(w - radius, 0)
-  ctx.arcTo(w, 0, w, radius, radius)
-  ctx.lineTo(w, 3)
-  ctx.lineTo(0, 3)
-  ctx.lineTo(0, radius)
-  ctx.arcTo(0, 0, radius, 0, radius)
-  ctx.closePath()
+  drawRoundedRect(ctx, 0, 0, w, h, radius)
+  ctx.clip()
   ctx.fillStyle = node.nodeColor
-  ctx.fill()
+  ctx.fillRect(0, 0, w, 3)
   ctx.restore()
 
   // Avatar area
