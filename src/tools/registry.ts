@@ -17,7 +17,7 @@ export const tools: ToolDefinition[] = [
   { id: 'file-converter', label: 'File Converter', description: 'Convert between file formats', category: 'files', icon: 'ArrowRightLeft' },
 
   // Creators
-  { id: 'form-creator', label: 'Form Creator', description: 'Design and export printable forms', category: 'creators', icon: 'ClipboardList' },
+  { id: 'form-creator', label: 'Form Builder', description: 'Design and export printable forms', category: 'creators', icon: 'ClipboardList' },
   { id: 'org-chart', label: 'Org Chart', description: 'Create organization charts', category: 'creators', icon: 'Network' },
   { id: 'dashboard', label: 'Dashboard', description: 'Build data dashboards from CSV/Excel', category: 'creators', icon: 'LayoutDashboard' },
   { id: 'flowchart', label: 'Flow Chart', description: 'Auto-generate flowcharts from text', category: 'creators', icon: 'GitBranch' },
