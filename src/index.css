@@ -161,6 +161,23 @@
     50% { opacity: 0.3; }
   }
 
+  /* Shooting stars — faint streaks across the top */
+  .shooting-star {
+    position: absolute;
+    width: var(--length, 150px);
+    height: 1px;
+    background: linear-gradient(to right, transparent 0%, rgba(255,255,255,0.35) 100%);
+    transform-origin: right center;
+    animation: shoot var(--duration, 400ms) linear forwards;
+  }
+
+  @keyframes shoot {
+    0%   { transform: rotate(var(--angle, 10deg)) translateX(0); opacity: 0; }
+    10%  { opacity: 0.6; }
+    50%  { opacity: 0.4; }
+    100% { transform: rotate(var(--angle, 10deg)) translateX(var(--travel, 500px)); opacity: 0; }
+  }
+
   /* Scrollbar styling */
   ::-webkit-scrollbar {
     width: 6px;

@@ -111,6 +111,22 @@
   @keyframes twinkle1 { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
   @keyframes twinkle2 { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
+  /* ── Shooting Stars ── */
+  .shooting-stars { position: fixed; inset: 0; pointer-events: none; overflow: hidden; z-index: 0; }
+  .shooting-star {
+    position: absolute;
+    height: 1px;
+    background: linear-gradient(to right, transparent 0%, rgba(255,255,255,0.35) 100%);
+    transform-origin: right center;
+    animation: shoot var(--duration, 400ms) linear forwards;
+  }
+  @keyframes shoot {
+    0%   { transform: rotate(var(--angle, 10deg)) translateX(0); opacity: 0; }
+    10%  { opacity: 0.6; }
+    50%  { opacity: 0.4; }
+    100% { transform: rotate(var(--angle, 10deg)) translateX(var(--travel, 500px)); opacity: 0; }
+  }
+
   /* ── Scroll Sections ── */
   section {
     position: relative;
@@ -524,6 +540,7 @@
 </style>
 </head>
 <body>
+<div class="shooting-stars" id="shootingStars"></div>
 
 <!-- ═══════════════════════════════════════════════════════ -->
 <!-- SLIDE 1: HERO -->
@@ -789,6 +806,37 @@
   }, { threshold: 0.5 });
 
   counters.forEach(c => counterObserver.observe(c));
+})();
+</script>
+<script>
+// Shooting stars
+(function() {
+  var container = document.getElementById('shootingStars');
+  function spawn() {
+    var el = document.createElement('div');
+    el.className = 'shooting-star';
+    var goLeft = Math.random() > 0.5;
+    var x = goLeft ? 40 + Math.random() * 55 : 5 + Math.random() * 55;
+    var y = Math.random() * 10;
+    var tilt = 5 + Math.random() * 20;
+    var angle = goLeft ? 180 + tilt : -tilt;
+    var travel = 400 + Math.random() * 600;
+    var duration = 300 + Math.random() * 300;
+    var length = 120 + Math.random() * 100;
+    el.style.left = x + 'vw';
+    el.style.top = y + 'vh';
+    el.style.width = length + 'px';
+    el.style.setProperty('--angle', angle + 'deg');
+    el.style.setProperty('--travel', travel + 'px');
+    el.style.setProperty('--duration', duration + 'ms');
+    container.appendChild(el);
+    setTimeout(function() { el.remove(); }, duration + 50);
+  }
+  function schedule() {
+    var delay = 4000 + Math.random() * 6000;
+    setTimeout(function() { spawn(); schedule(); }, delay);
+  }
+  setTimeout(function() { spawn(); schedule(); }, 2000);
 })();
 </script>
 </body>
