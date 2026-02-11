@@ -108,9 +108,13 @@ export function useFormStore() {
       const maxBottom = Math.max(...pageElements.map(el => el.y + el.height))
       y = Math.min(maxBottom + 16, pageDim.heightPx - PAGE_MARGIN - defaults.height)
     }
+    // Full-width elements should span the content area
+    const contentWidth = pageDim.widthPx - 2 * PAGE_MARGIN
+    const fullWidthOverride = (type === 'divider' || type === 'heading') ? { width: contentWidth } : {}
     const el = createElement(type, pageIndex, {
       x: PAGE_MARGIN,
       y: Math.max(PAGE_MARGIN, y),
+      ...fullWidthOverride,
       ...overrides,
     })
     updateDoc(prev => ({ ...prev, elements: [...prev.elements, el] }))
@@ -217,7 +221,7 @@ export function useFormStore() {
     const offset = 20 // offset pasted elements slightly
     const newElements = clipboard.map(el => ({
       ...el,
-      id: Math.random().toString(36).substring(2, 11),
+      id: crypto.randomUUID(),
       pageIndex: page,
       x: el.x + offset,
       y: el.y + offset,
@@ -234,7 +238,7 @@ export function useFormStore() {
     if (selected.length === 0) return
     const newElements = selected.map(el => ({
       ...el,
-      id: Math.random().toString(36).substring(2, 11),
+      id: crypto.randomUUID(),
       x: el.x + 20,
       y: el.y + 20,
     }))

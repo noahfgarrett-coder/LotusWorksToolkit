@@ -155,7 +155,7 @@ function ElementContent({ element }: { element: FormElement }) {
       )
 
     case 'divider':
-      return <div className="w-full h-0.5 bg-gray-400 mt-[50%] translate-y-[-50%]" />
+      return <div className="w-full h-full flex items-center"><div className="w-full h-0.5 bg-gray-400" /></div>
 
     default:
       return <div className="w-full h-full" />

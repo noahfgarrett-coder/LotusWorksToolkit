@@ -24,10 +24,13 @@ function getIcon(name: string, size = 18, className = '') {
 }
 
 export function Sidebar() {
-  const {
-    activeTool, sidebarExpanded, sidebarCategories,
-    setActiveTool, goHome, toggleSidebar, toggleCategory,
-  } = useAppStore()
+  const activeTool = useAppStore((s) => s.activeTool)
+  const sidebarExpanded = useAppStore((s) => s.sidebarExpanded)
+  const sidebarCategories = useAppStore((s) => s.sidebarCategories)
+  const setActiveTool = useAppStore((s) => s.setActiveTool)
+  const goHome = useAppStore((s) => s.goHome)
+  const toggleSidebar = useAppStore((s) => s.toggleSidebar)
+  const toggleCategory = useAppStore((s) => s.toggleCategory)
 
   return (
     <aside

@@ -8,15 +8,8 @@ import * as pdfjsLib from 'pdfjs-dist'
 import { readFileAsDataURL } from '@/utils/fileReader.ts'
 import { loadImage, resizeImage, canvasToBlob } from '@/utils/imageProcessing.ts'
 
-// Set up PDF.js worker (mirrors src/utils/pdf.ts setup)
-try {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-    'pdfjs-dist/build/pdf.worker.min.mjs',
-    import.meta.url,
-  ).toString()
-} catch {
-  // Worker may already be configured via pdf.ts — this is fine
-}
+// Centralized PDF.js worker setup (side-effect import)
+import '@/utils/pdfWorkerSetup.ts'
 
 // ── Type detection ──────────────────────────────────────────────
 

@@ -91,16 +91,16 @@ export const ELEMENT_DEFAULTS: Record<FormElementType, { width: number; height: 
   'select':     { width: 250, height: 50,  label: 'Dropdown' },
   'date':       { width: 200, height: 50,  label: 'Date' },
   'label':      { width: 200, height: 30,  label: 'Label Text' },
-  'heading':    { width: 400, height: 40,  label: 'Section Heading' },
+  'heading':    { width: 720, height: 40,  label: 'Section Heading' },
   'signature':  { width: 250, height: 60,  label: 'Signature' },
   'image':      { width: 200, height: 150, label: 'Image' },
-  'divider':    { width: 500, height: 4,   label: '' },
+  'divider':    { width: 720, height: 4,   label: '' },
 }
 
 // ── Factory Functions ───────────────────────────────────────
 
 export function genId(): string {
-  return Math.random().toString(36).substring(2, 11)
+  return crypto.randomUUID()
 }
 
 export function createElement(

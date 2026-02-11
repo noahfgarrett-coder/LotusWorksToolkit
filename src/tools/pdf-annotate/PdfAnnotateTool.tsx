@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { FileDropZone } from '@/components/common/FileDropZone.tsx'
 import { Button } from '@/components/common/Button.tsx'
+import { Modal } from '@/components/common/Modal.tsx'
 import { loadPDFFile, renderPageToCanvas, generateThumbnail } from '@/utils/pdf.ts'
 import { downloadBlob } from '@/utils/download.ts'
 import { formatFileSize } from '@/utils/fileReader.ts'
@@ -10,18 +11,18 @@ import {
   Download, RotateCcw, RotateCw, Undo2, Redo2,
   Pencil, Highlighter, Square, Circle, ArrowUpRight, Minus, Type, Eraser,
   ZoomIn, ZoomOut, Maximize, Cloud, ChevronDown, ChevronLeft, ChevronRight, PanelLeft,
-  MessageSquare, X,
+  MessageSquare, X, Ruler,
 } from 'lucide-react'
 
 // ── Types ──────────────────────────────────────────────
 
-type ToolType = 'pencil' | 'highlighter' | 'rectangle' | 'circle' | 'arrow' | 'line' | 'text' | 'eraser' | 'cloud' | 'callout'
+type ToolType = 'pencil' | 'highlighter' | 'rectangle' | 'circle' | 'arrow' | 'line' | 'text' | 'eraser' | 'cloud' | 'callout' | 'measure'
 
 interface Point { x: number; y: number }
 
 interface Annotation {
   id: string
-  type: Exclude<ToolType, 'eraser'>
+  type: Exclude<ToolType, 'eraser' | 'measure'>
   points: Point[]
   color: string
   strokeWidth: number
@@ -35,6 +36,18 @@ interface Annotation {
 }
 
 type PageAnnotations = Record<number, Annotation[]>
+
+interface Measurement {
+  id: string
+  startPt: Point
+  endPt: Point
+  page: number
+}
+
+interface CalibrationState {
+  pixelsPerUnit: number | null
+  unit: string
+}
 
 // ── Constants ──────────────────────────────────────────
 
@@ -85,10 +98,10 @@ const CURSOR_MAP: Record<ToolType, string> = {
   pencil: 'crosshair', highlighter: 'crosshair', line: 'crosshair',
   arrow: 'crosshair', rectangle: 'crosshair', circle: 'crosshair',
   cloud: 'crosshair', text: 'crosshair', eraser: 'none',
-  callout: 'crosshair',
+  callout: 'crosshair', measure: 'crosshair',
 }
 
-function genId() { return Math.random().toString(36).substring(2, 11) }
+function genId() { return crypto.randomUUID() }
 
 /** Typed wrapper around the File System Access API — eliminates `any` casts */
 interface PickerHandle {
@@ -498,6 +511,191 @@ function toPdfCoords(p: Point, origW: number, origH: number, rotation: number): 
   }
 }
 
+// ── Pixel snapping for measurement tool ────────────────
+
+/**
+ * Snap a measurement endpoint to the farthest non-transparent pixel
+ * along the measurement direction within a search corridor.
+ * Returns the snapped point in doc-space, or the original point if no content found.
+ */
+function snapToContent(
+  clickPt: Point,
+  otherPt: Point | null,
+  annCanvas: HTMLCanvasElement,
+  searchRadius: number,
+  corridorWidth: number,
+): Point {
+  // First endpoint or no direction — skip snapping
+  if (!otherPt) return clickPt
+
+  const ctx = annCanvas.getContext('2d')
+  if (!ctx) return clickPt
+
+  const scale = RENDER_SCALE
+  // Direction vector from other endpoint toward click point (outward)
+  const dx = clickPt.x - otherPt.x
+  const dy = clickPt.y - otherPt.y
+  const len = Math.hypot(dx, dy)
+  if (len < 1) return clickPt
+
+  const dirX = dx / len
+  const dirY = dy / len
+  // Perpendicular
+  const perpX = -dirY
+  const perpY = dirX
+
+  // Read image data for the search region
+  const cx = clickPt.x * scale
+  const cy = clickPt.y * scale
+  const r = searchRadius * scale
+  const x0 = Math.max(0, Math.floor(cx - r))
+  const y0 = Math.max(0, Math.floor(cy - r))
+  const x1 = Math.min(annCanvas.width, Math.ceil(cx + r))
+  const y1 = Math.min(annCanvas.height, Math.ceil(cy + r))
+  const w = x1 - x0
+  const h = y1 - y0
+  if (w <= 0 || h <= 0) return clickPt
+
+  let imageData: ImageData
+  try {
+    imageData = ctx.getImageData(x0, y0, w, h)
+  } catch {
+    return clickPt
+  }
+  const data = imageData.data
+
+  // Walk outward from click in direction steps, scanning a narrow corridor
+  let farthestPt: Point | null = null
+  const halfCorridor = corridorWidth * scale
+
+  for (let step = -searchRadius; step <= searchRadius; step++) {
+    const sampleX = cx + dirX * step * scale
+    const sampleY = cy + dirY * step * scale
+
+    // Scan across corridor perpendicular to direction
+    for (let c = -halfCorridor; c <= halfCorridor; c++) {
+      const px = Math.round(sampleX + perpX * c - x0)
+      const py = Math.round(sampleY + perpY * c - y0)
+      if (px < 0 || px >= w || py < 0 || py >= h) continue
+
+      const idx = (py * w + px) * 4
+      const alpha = data[idx + 3]
+      if (alpha > 10) {
+        // Found content — keep if it's the farthest along direction
+        const candidateX = (sampleX) / scale
+        const candidateY = (sampleY) / scale
+        if (!farthestPt) {
+          farthestPt = { x: candidateX, y: candidateY }
+        } else {
+          // Compare distance along direction from otherPt
+          const prevDist = (farthestPt.x - otherPt.x) * dirX + (farthestPt.y - otherPt.y) * dirY
+          const newDist = (candidateX - otherPt.x) * dirX + (candidateY - otherPt.y) * dirY
+          if (newDist > prevDist) {
+            farthestPt = { x: candidateX, y: candidateY }
+          }
+        }
+        break // found content in this corridor scan, move to next step
+      }
+    }
+  }
+
+  return farthestPt ?? clickPt
+}
+
+// ── Measurement drawing ────────────────────────────────
+
+function drawMeasurement(
+  ctx: CanvasRenderingContext2D,
+  m: Measurement,
+  scale: number,
+  calibration: CalibrationState,
+  isSelected: boolean,
+) {
+  const sx = m.startPt.x * scale
+  const sy = m.startPt.y * scale
+  const ex = m.endPt.x * scale
+  const ey = m.endPt.y * scale
+  const pxDist = Math.hypot(m.endPt.x - m.startPt.x, m.endPt.y - m.startPt.y)
+
+  ctx.save()
+
+  // Dashed cyan line
+  ctx.strokeStyle = isSelected ? '#06B6D4' : '#22D3EE'
+  ctx.lineWidth = isSelected ? 2.5 : 1.5
+  ctx.setLineDash([6, 4])
+  ctx.beginPath()
+  ctx.moveTo(sx, sy)
+  ctx.lineTo(ex, ey)
+  ctx.stroke()
+  ctx.setLineDash([])
+
+  // Endpoint circles
+  ctx.fillStyle = isSelected ? '#06B6D4' : '#22D3EE'
+  for (const [px, py] of [[sx, sy], [ex, ey]] as const) {
+    ctx.beginPath()
+    ctx.arc(px, py, isSelected ? 5 : 4, 0, Math.PI * 2)
+    ctx.fill()
+  }
+
+  // Distance label at midpoint
+  const mx = (sx + ex) / 2
+  const my = (sy + ey) / 2
+  const angle = Math.atan2(ey - sy, ex - sx)
+  // Keep text readable (don't flip upside down)
+  const textAngle = (angle > Math.PI / 2 || angle < -Math.PI / 2)
+    ? angle + Math.PI
+    : angle
+
+  let label: string
+  if (calibration.pixelsPerUnit !== null) {
+    const realDist = pxDist / calibration.pixelsPerUnit
+    label = `${realDist.toFixed(2)} ${calibration.unit}`
+  } else {
+    label = `${pxDist.toFixed(1)} px`
+  }
+
+  ctx.save()
+  ctx.translate(mx, my)
+  ctx.rotate(textAngle)
+
+  ctx.font = `600 11px system-ui, sans-serif`
+  const metrics = ctx.measureText(label)
+  const padX = 6
+  const padY = 3
+  const tw = metrics.width + padX * 2
+  const th = 16 + padY * 2
+
+  // Pill background
+  const radius = th / 2
+  ctx.fillStyle = isSelected ? 'rgba(6, 182, 212, 0.95)' : 'rgba(0, 40, 50, 0.85)'
+  ctx.beginPath()
+  ctx.roundRect(-tw / 2, -th / 2, tw, th, radius)
+  ctx.fill()
+
+  // Border
+  ctx.strokeStyle = isSelected ? '#06B6D4' : '#22D3EE'
+  ctx.lineWidth = 1
+  ctx.beginPath()
+  ctx.roundRect(-tw / 2, -th / 2, tw, th, radius)
+  ctx.stroke()
+
+  // Text
+  ctx.fillStyle = isSelected ? '#ffffff' : '#22D3EE'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(label, 0, 0)
+
+  ctx.restore()
+  ctx.restore()
+}
+
+/** Check if a point is within range of a measurement's midpoint label. */
+function hitTestMeasurementLabel(pt: Point, m: Measurement, threshold: number): boolean {
+  const mx = (m.startPt.x + m.endPt.x) / 2
+  const my = (m.startPt.y + m.endPt.y) / 2
+  return Math.hypot(pt.x - mx, pt.y - my) < threshold
+}
+
 // ── Canvas drawing ─────────────────────────────────────
 
 function drawAnnotation(ctx: CanvasRenderingContext2D, ann: Annotation, scale: number) {
@@ -798,6 +996,17 @@ export default function PdfAnnotateTool() {
   const cloudPreviewRef = useRef<Point | null>(null)
   const cloudLastClickRef = useRef<{ time: number; pt: Point }>({ time: 0, pt: { x: 0, y: 0 } })
 
+  // Measurement tool
+  const [measurements, setMeasurements] = useState<Record<number, Measurement[]>>({})
+  const [calibration, setCalibration] = useState<CalibrationState>({ pixelsPerUnit: null, unit: 'in' })
+  const [calibrateModalOpen, setCalibrateModalOpen] = useState(false)
+  const [calibrateMeasureId, setCalibrateMeasureId] = useState<string | null>(null)
+  const [calibrateValue, setCalibrateValue] = useState('')
+  const [calibrateUnit, setCalibrateUnit] = useState('in')
+  const measureStartRef = useRef<Point | null>(null)
+  const measurePreviewRef = useRef<Point | null>(null)
+  const [selectedMeasureId, setSelectedMeasureId] = useState<string | null>(null)
+
   // Sidebar
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [thumbnails, setThumbnails] = useState<Record<number, string>>({})
@@ -884,11 +1093,11 @@ export default function PdfAnnotateTool() {
     for (const frag of mods.added) drawAnnotation(ctx, frag, RENDER_SCALE)
 
     // In-progress stroke
-    if (isDrawingRef.current && activeTool !== 'eraser' && activeTool !== 'text' && activeTool !== 'callout' && activeTool !== 'cloud') {
+    if (isDrawingRef.current && activeTool !== 'eraser' && activeTool !== 'text' && activeTool !== 'callout' && activeTool !== 'cloud' && activeTool !== 'measure') {
       const pts = currentPtsRef.current
       if (pts.length > 0) {
         const inProgress: Annotation = {
-          id: '_progress', type: activeTool,
+          id: '_progress', type: activeTool as Annotation['type'],
           points: pts, color, fontSize,
           strokeWidth: activeTool === 'highlighter' ? strokeWidth * 3 : strokeWidth,
           opacity: activeTool === 'highlighter' ? 0.4 : opacity / 100,
@@ -1005,7 +1214,23 @@ export default function PdfAnnotateTool() {
         ctx.restore()
       }
     }
-  }, [annotations, currentPage, activeTool, selectedAnnId, color, strokeWidth, opacity, fontSize])
+    // Committed measurements for current page
+    const pageMeasurements = measurements[currentPage] || []
+    for (const m of pageMeasurements) {
+      drawMeasurement(ctx, m, RENDER_SCALE, calibration, m.id === selectedMeasureId)
+    }
+
+    // In-progress measurement preview
+    if (activeTool === 'measure' && measureStartRef.current && measurePreviewRef.current) {
+      const preview: Measurement = {
+        id: '_measure_preview',
+        startPt: measureStartRef.current,
+        endPt: measurePreviewRef.current,
+        page: currentPage,
+      }
+      drawMeasurement(ctx, preview, RENDER_SCALE, calibration, false)
+    }
+  }, [annotations, currentPage, activeTool, selectedAnnId, color, strokeWidth, opacity, fontSize, measurements, calibration, selectedMeasureId])
 
   // ── History management ───────────────────────────────
 
@@ -1135,6 +1360,11 @@ export default function PdfAnnotateTool() {
       setPageRotations({})
       setSelectedAnnId(null)
       setEditingTextId(null)
+      setMeasurements({})
+      setCalibration({ pixelsPerUnit: null, unit: 'in' })
+      setSelectedMeasureId(null)
+      measureStartRef.current = null
+      measurePreviewRef.current = null
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error'
       setLoadError(`Failed to load PDF: ${msg}`)
@@ -1180,7 +1410,7 @@ export default function PdfAnnotateTool() {
   // ── Re-render annotations ────────────────────────────
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { redraw() }, [pdfReady, annotations, selectedAnnId])
+  useEffect(() => { redraw() }, [pdfReady, annotations, selectedAnnId, measurements, calibration, selectedMeasureId])
 
   // ── Keyboard shortcuts ───────────────────────────────
 
@@ -1188,18 +1418,44 @@ export default function PdfAnnotateTool() {
     const handler = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey
       if (editingTextId) return // Don't intercept while editing text
+
+      // Escape: cancel in-progress measurement
+      if (e.key === 'Escape' && activeTool === 'measure' && measureStartRef.current) {
+        e.preventDefault()
+        measureStartRef.current = null
+        measurePreviewRef.current = null
+        redraw()
+        return
+      }
+
       if (mod && e.key === 'z' && !e.shiftKey) { e.preventDefault(); undo() }
       else if (mod && e.key === 'z' && e.shiftKey) { e.preventDefault(); redo() }
       else if (mod && e.key === 'y') { e.preventDefault(); redo() }
-      else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedAnnId && !editingTextId) {
-        e.preventDefault()
-        removeAnnotation(selectedAnnId)
-        setSelectedAnnId(null)
+      else if ((e.key === 'Delete' || e.key === 'Backspace') && !editingTextId) {
+        // Delete selected measurement
+        if (selectedMeasureId) {
+          e.preventDefault()
+          setMeasurements(prev => {
+            const updated = { ...prev }
+            for (const [page, list] of Object.entries(updated)) {
+              updated[Number(page)] = list.filter(m => m.id !== selectedMeasureId)
+            }
+            return updated
+          })
+          setSelectedMeasureId(null)
+          return
+        }
+        // Delete selected annotation
+        if (selectedAnnId) {
+          e.preventDefault()
+          removeAnnotation(selectedAnnId)
+          setSelectedAnnId(null)
+        }
       }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [undo, redo, selectedAnnId, editingTextId, removeAnnotation])
+  }, [undo, redo, selectedAnnId, editingTextId, removeAnnotation, activeTool, selectedMeasureId, redraw])
 
   // ── Zoom with scroll wheel ───────────────────────────
 
@@ -1227,9 +1483,12 @@ export default function PdfAnnotateTool() {
     calloutArrowDragRef.current = null
     cloudPreviewRef.current = null
     cloudLastClickRef.current = { time: 0, pt: { x: 0, y: 0 } }
+    measureStartRef.current = null
+    measurePreviewRef.current = null
     setStraightLineMode(false)
     setEraserCursorPos(null)
     setSelectedAnnId(null)
+    setSelectedMeasureId(null)
     if (activeTool === 'cloud') setColor('#ff0000')
     if (editingTextId) {
       // Commit any open text edit
@@ -1295,6 +1554,49 @@ export default function PdfAnnotateTool() {
     if (e.button !== 0) return
     e.currentTarget.setPointerCapture(e.pointerId)
     const pt = getPoint(e)
+
+    // ── Measure tool: click-click placement ──
+    if (activeTool === 'measure') {
+      // First: check if clicking an existing measurement's label → open calibration
+      const pageMeas = measurements[currentPage] || []
+      for (const m of pageMeas) {
+        if (hitTestMeasurementLabel(pt, m, 20)) {
+          setSelectedMeasureId(m.id)
+          setCalibrateMeasureId(m.id)
+          setCalibrateValue('')
+          setCalibrateModalOpen(true)
+          return
+        }
+      }
+
+      if (measureStartRef.current) {
+        // Second click: snap end point and create measurement
+        const annCanvas = annCanvasRef.current
+        const snapped = annCanvas
+          ? snapToContent(pt, measureStartRef.current, annCanvas, 30, 3)
+          : pt
+        const m: Measurement = {
+          id: crypto.randomUUID(),
+          startPt: measureStartRef.current,
+          endPt: snapped,
+          page: currentPage,
+        }
+        setMeasurements(prev => ({
+          ...prev,
+          [currentPage]: [...(prev[currentPage] || []), m],
+        }))
+        setSelectedMeasureId(m.id)
+        measureStartRef.current = null
+        measurePreviewRef.current = null
+        redraw()
+      } else {
+        // First click: store start point
+        measureStartRef.current = pt
+        measurePreviewRef.current = pt
+        setSelectedMeasureId(null)
+      }
+      return
+    }
 
     // ── Cloud tool: click-to-place vertices ──
     if (activeTool === 'cloud') {
@@ -1501,6 +1803,13 @@ export default function PdfAnnotateTool() {
     if (activeTool === 'eraser' && annCanvasRef.current) {
       const rect = annCanvasRef.current.getBoundingClientRect()
       setEraserCursorPos({ x: e.clientX - rect.left, y: e.clientY - rect.top })
+    }
+
+    // Measure tool: track cursor for preview line
+    if (activeTool === 'measure' && measureStartRef.current) {
+      measurePreviewRef.current = getPoint(e)
+      redraw()
+      return
     }
 
     // Cloud polygon: track cursor for preview
@@ -1790,7 +2099,7 @@ export default function PdfAnnotateTool() {
     const isHL = activeTool === 'highlighter'
     const ann: Annotation = {
       id: genId(),
-      type: activeTool as Exclude<ToolType, 'eraser'>,
+      type: activeTool as Exclude<ToolType, 'eraser' | 'measure'>,
       points: [...pts],
       color,
       strokeWidth: isHL ? strokeWidth * 3 : strokeWidth,
@@ -2046,6 +2355,13 @@ export default function PdfAnnotateTool() {
     setSelectedAnnId(null)
     setEditingTextId(null)
     setEditingTextValue('')
+    setMeasurements({})
+    setCalibration({ pixelsPerUnit: null, unit: 'in' })
+    setCalibrateModalOpen(false)
+    setCalibrateMeasureId(null)
+    setSelectedMeasureId(null)
+    measureStartRef.current = null
+    measurePreviewRef.current = null
   }, [])
 
   // ── Render ───────────────────────────────────────────
@@ -2089,224 +2405,296 @@ export default function PdfAnnotateTool() {
   return (
     <div className="h-full flex flex-col">
       {/* ── Toolbar ─────────────────────────────── */}
-      <div className="flex items-center gap-1 px-3 py-2 border-b border-white/[0.06] flex-shrink-0 flex-wrap">
-        {/* Sidebar toggle */}
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-white/[0.06] flex-shrink-0 flex-wrap">
+        {/* ── Pages group ── */}
         {pdfFile.pageCount > 1 && (
           <>
-            <button onClick={() => setSidebarOpen(o => !o)} title="Page thumbnails" aria-label="Toggle page thumbnails"
+            <div className="flex flex-col items-center gap-0.5">
+              <span className="text-[8px] text-white/25 uppercase tracking-wider leading-none">Pages</span>
+              <div className="flex items-center gap-0.5">
+                <button onClick={() => setSidebarOpen(o => !o)} title="Page thumbnails" aria-label="Toggle page thumbnails"
+                  className={`p-1.5 rounded-md transition-colors ${
+                    sidebarOpen ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
+                  }`}>
+                  <PanelLeft size={16} />
+                </button>
+              </div>
+            </div>
+            <div className="w-px h-8 bg-white/[0.08]" />
+          </>
+        )}
+
+        {/* ── Draw group ── */}
+        <div className="flex flex-col items-center gap-0.5">
+          <span className="text-[8px] text-white/25 uppercase tracking-wider leading-none">Draw</span>
+          <div className="flex items-center gap-0.5">
+            {/* Shapes dropdown */}
+            <div ref={shapesDropdownRef} className="relative">
+              <button
+                onClick={() => { if (!isDrawTool) setActiveTool(activeDraw); setShapesDropdownOpen(o => !o) }}
+                title={activeDrawDef.label}
+                aria-label={`Drawing tool: ${activeDrawDef.label}`}
+                className={`p-1.5 rounded-md flex items-center gap-0.5 transition-colors ${
+                  isDrawTool ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
+                }`}>
+                <ActiveDrawIcon size={16} />
+                <ChevronDown size={10} className="opacity-50" />
+              </button>
+              {shapesDropdownOpen && (
+                <div className="absolute top-full left-0 mt-1 bg-[#001a24] border border-white/[0.1] rounded-lg shadow-lg z-50 py-1 min-w-[140px]">
+                  {DRAW_TOOLS.map(s => (
+                    <button key={s.type}
+                      onClick={() => { setActiveTool(s.type); setActiveDraw(s.type); setShapesDropdownOpen(false) }}
+                      className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors ${
+                        activeTool === s.type ? 'bg-[#F47B20]/20 text-[#F47B20]' : 'text-white/60 hover:text-white hover:bg-white/[0.06]'
+                      }`}>
+                      <s.icon size={14} />
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Highlighter */}
+            <button onClick={() => setActiveTool('highlighter')} title="Highlighter" aria-label="Highlighter"
               className={`p-1.5 rounded-md transition-colors ${
-                sidebarOpen ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
+                activeTool === 'highlighter' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
               }`}>
-              <PanelLeft size={16} />
+              <Highlighter size={16} />
             </button>
-            <div className="w-px h-5 bg-white/[0.08] mx-1" />
-          </>
-        )}
 
-        {/* Draw tools dropdown */}
-        <div ref={shapesDropdownRef} className="relative">
-          <button
-            onClick={() => { if (!isDrawTool) setActiveTool(activeDraw); setShapesDropdownOpen(o => !o) }}
-            title={activeDrawDef.label}
-            aria-label={`Drawing tool: ${activeDrawDef.label}`}
-            className={`p-1.5 rounded-md flex items-center gap-0.5 transition-colors ${
-              isDrawTool ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
-            }`}>
-            <ActiveDrawIcon size={16} />
-            <ChevronDown size={10} className="opacity-50" />
-          </button>
-          {shapesDropdownOpen && (
-            <div className="absolute top-full left-0 mt-1 bg-[#001a24] border border-white/[0.1] rounded-lg shadow-lg z-50 py-1 min-w-[140px]">
-              {DRAW_TOOLS.map(s => (
-                <button key={s.type}
-                  onClick={() => { setActiveTool(s.type); setActiveDraw(s.type); setShapesDropdownOpen(false) }}
-                  className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors ${
-                    activeTool === s.type ? 'bg-[#F47B20]/20 text-[#F47B20]' : 'text-white/60 hover:text-white hover:bg-white/[0.06]'
-                  }`}>
-                  <s.icon size={14} />
-                  {s.label}
-                </button>
-              ))}
+            {/* Text tools dropdown */}
+            <div ref={textDropdownRef} className="relative">
+              <button
+                onClick={() => { if (!isTextTool) setActiveTool(activeText); setTextDropdownOpen(o => !o) }}
+                title={activeTextDef.label}
+                aria-label={`Text tool: ${activeTextDef.label}`}
+                className={`p-1.5 rounded-md flex items-center gap-0.5 transition-colors ${
+                  isTextTool ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
+                }`}>
+                <ActiveTextIcon size={16} />
+                <ChevronDown size={10} className="opacity-50" />
+              </button>
+              {textDropdownOpen && (
+                <div className="absolute top-full left-0 mt-1 bg-[#001a24] border border-white/[0.1] rounded-lg shadow-lg z-50 py-1 min-w-[140px]">
+                  {TEXT_TOOLS.map(s => (
+                    <button key={s.type}
+                      onClick={() => { setActiveTool(s.type); setActiveText(s.type); setTextDropdownOpen(false) }}
+                      className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors ${
+                        activeTool === s.type ? 'bg-[#F47B20]/20 text-[#F47B20]' : 'text-white/60 hover:text-white hover:bg-white/[0.06]'
+                      }`}>
+                      <s.icon size={14} />
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
-          )}
+
+            {/* Eraser */}
+            <button onClick={() => setActiveTool('eraser')} title="Eraser" aria-label="Eraser"
+              className={`p-1.5 rounded-md transition-colors ${
+                activeTool === 'eraser' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
+              }`}>
+              <Eraser size={16} />
+            </button>
+
+            {/* Measure */}
+            <button onClick={() => setActiveTool('measure')} title="Measure" aria-label="Measure"
+              className={`p-1.5 rounded-md transition-colors ${
+                activeTool === 'measure' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
+              }`}>
+              <Ruler size={16} />
+            </button>
+          </div>
         </div>
 
-        {/* Highlighter */}
-        <button onClick={() => setActiveTool('highlighter')} title="Highlighter" aria-label="Highlighter"
-          className={`p-1.5 rounded-md transition-colors ${
-            activeTool === 'highlighter' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
-          }`}>
-          <Highlighter size={16} />
-        </button>
+        <div className="w-px h-8 bg-white/[0.08]" />
 
-        {/* Text tools dropdown */}
-        <div ref={textDropdownRef} className="relative">
-          <button
-            onClick={() => { if (!isTextTool) setActiveTool(activeText); setTextDropdownOpen(o => !o) }}
-            title={activeTextDef.label}
-            aria-label={`Text tool: ${activeTextDef.label}`}
-            className={`p-1.5 rounded-md flex items-center gap-0.5 transition-colors ${
-              isTextTool ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
-            }`}>
-            <ActiveTextIcon size={16} />
-            <ChevronDown size={10} className="opacity-50" />
-          </button>
-          {textDropdownOpen && (
-            <div className="absolute top-full left-0 mt-1 bg-[#001a24] border border-white/[0.1] rounded-lg shadow-lg z-50 py-1 min-w-[140px]">
-              {TEXT_TOOLS.map(s => (
-                <button key={s.type}
-                  onClick={() => { setActiveTool(s.type); setActiveText(s.type); setTextDropdownOpen(false) }}
-                  className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors ${
-                    activeTool === s.type ? 'bg-[#F47B20]/20 text-[#F47B20]' : 'text-white/60 hover:text-white hover:bg-white/[0.06]'
-                  }`}>
-                  <s.icon size={14} />
-                  {s.label}
-                </button>
-              ))}
-            </div>
-          )}
+        {/* ── Style group ── */}
+        <div className="flex flex-col items-center gap-0.5">
+          <span className="text-[8px] text-white/25 uppercase tracking-wider leading-none">Style</span>
+          <div className="flex items-center gap-1">
+            {/* Color */}
+            <label className="w-7 h-7 rounded-md border border-white/[0.12] cursor-pointer flex-shrink-0 overflow-hidden"
+              style={{ backgroundColor: color }} aria-label="Annotation color">
+              <input type="color" value={color} onChange={e => setColor(e.target.value)} className="opacity-0 w-0 h-0" aria-label="Choose annotation color" />
+            </label>
+
+            {/* Stroke width */}
+            {activeTool !== 'text' && activeTool !== 'callout' && activeTool !== 'eraser' && activeTool !== 'measure' && (
+              <div className="flex items-center gap-1">
+                <span className="text-[10px] text-white/40">W</span>
+                <input type="range" min={1} max={20} value={strokeWidth}
+                  onChange={e => setStrokeWidth(Number(e.target.value))}
+                  className="w-16 h-1 bg-white/[0.08] rounded-full appearance-none cursor-pointer
+                    [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                    [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-[#F47B20] [&::-webkit-slider-thumb]:cursor-pointer" />
+                <span className="text-[10px] text-white/40 w-4">{strokeWidth}</span>
+              </div>
+            )}
+
+            {/* Eraser controls */}
+            {activeTool === 'eraser' && (
+              <>
+                <div className="flex items-center bg-white/[0.06] rounded-md p-0.5">
+                  <button onClick={() => setEraserMode('partial')} title="Partial erase — only removes what's under cursor"
+                    className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${
+                      eraserMode === 'partial' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white'
+                    }`}>Partial</button>
+                  <button onClick={() => setEraserMode('object')} title="Object erase — deletes entire annotation on touch"
+                    className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${
+                      eraserMode === 'object' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white'
+                    }`}>Object</button>
+                </div>
+                <div className="flex items-center gap-1">
+                  <span className="text-[10px] text-white/40">Size</span>
+                  <input type="range" min={5} max={50} value={eraserRadius}
+                    onChange={e => setEraserRadius(Number(e.target.value))}
+                    className="w-16 h-1 bg-white/[0.08] rounded-full appearance-none cursor-pointer
+                      [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                      [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-[#F47B20] [&::-webkit-slider-thumb]:cursor-pointer" />
+                  <span className="text-[10px] text-white/40 w-5">{eraserRadius}</span>
+                </div>
+              </>
+            )}
+
+            {/* Text/Callout: font family & size */}
+            {(activeTool === 'text' || activeTool === 'callout') && (
+              <>
+                <select value={fontFamily} onChange={e => setFontFamily(e.target.value)}
+                  className="px-1 py-0.5 text-[10px] bg-dark-surface border border-white/[0.1] rounded text-white max-w-[100px]">
+                  {FONT_FAMILIES.map(ff => (
+                    <option key={ff} value={ff} style={{ fontFamily: ff }}>{ff}</option>
+                  ))}
+                </select>
+                <div className="flex items-center gap-1">
+                  <span className="text-[10px] text-white/40">Sz</span>
+                  <input type="number" min={8} max={72} step={0.5} value={fontSize}
+                    onChange={e => setFontSize(Math.max(8, Math.min(72, Number(e.target.value))))}
+                    className="w-12 px-1 py-0.5 text-[10px] bg-dark-surface border border-white/[0.1] rounded text-white text-center" />
+                </div>
+              </>
+            )}
+
+            {/* Measure contextual controls */}
+            {activeTool === 'measure' && (
+              <>
+                {calibration.pixelsPerUnit !== null && (
+                  <span className="text-[10px] text-cyan-400/70">
+                    Scale: {calibration.pixelsPerUnit.toFixed(1)} px/{calibration.unit}
+                  </span>
+                )}
+                {(measurements[currentPage] || []).length > 0 && (
+                  <button
+                    onClick={() => {
+                      setMeasurements(prev => {
+                        const next = { ...prev }
+                        delete next[currentPage]
+                        return next
+                      })
+                      setSelectedMeasureId(null)
+                    }}
+                    className="px-1.5 py-0.5 rounded text-[10px] text-white/40 hover:text-white/60 border border-white/[0.08]"
+                  >
+                    Clear All
+                  </button>
+                )}
+                {calibration.pixelsPerUnit !== null && (
+                  <button
+                    onClick={() => setCalibration({ pixelsPerUnit: null, unit: 'in' })}
+                    className="px-1.5 py-0.5 rounded text-[10px] text-white/40 hover:text-white/60 border border-white/[0.08]"
+                  >
+                    Reset Scale
+                  </button>
+                )}
+              </>
+            )}
+
+            {/* Opacity (not for highlighter, eraser, or measure) */}
+            {activeTool !== 'highlighter' && activeTool !== 'eraser' && activeTool !== 'measure' && (
+              <div className="flex items-center gap-1">
+                <span className="text-[10px] text-white/40">O</span>
+                <input type="range" min={10} max={100} step={5} value={opacity}
+                  onChange={e => setOpacity(Number(e.target.value))}
+                  className="w-14 h-1 bg-white/[0.08] rounded-full appearance-none cursor-pointer
+                    [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
+                    [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-[#F47B20] [&::-webkit-slider-thumb]:cursor-pointer" />
+                <span className="text-[10px] text-white/40 w-6">{opacity}%</span>
+              </div>
+            )}
+
+            {/* Straight-line mode toggle */}
+            {(activeTool === 'pencil' || activeTool === 'highlighter') && (
+              <button onClick={() => setStraightLineMode(m => !m)}
+                title={straightLineMode ? 'Straight line mode (click for freehand)' : 'Freehand mode (click for straight)'}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ${
+                  straightLineMode
+                    ? 'bg-[#F47B20]/20 text-[#F47B20] border border-[#F47B20]/30'
+                    : 'text-white/40 hover:text-white/60 border border-white/[0.08]'
+                }`}>
+                {straightLineMode ? 'Straight' : 'Free'}
+              </button>
+            )}
+          </div>
         </div>
 
-        {/* Eraser */}
-        <button onClick={() => setActiveTool('eraser')} title="Eraser" aria-label="Eraser"
-          className={`p-1.5 rounded-md transition-colors ${
-            activeTool === 'eraser' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
-          }`}>
-          <Eraser size={16} />
-        </button>
+        <div className="w-px h-8 bg-white/[0.08]" />
 
-        <div className="w-px h-5 bg-white/[0.08] mx-1" />
-
-        {/* Color */}
-        <label className="w-7 h-7 rounded-md border border-white/[0.12] cursor-pointer flex-shrink-0 overflow-hidden"
-          style={{ backgroundColor: color }} aria-label="Annotation color">
-          <input type="color" value={color} onChange={e => setColor(e.target.value)} className="opacity-0 w-0 h-0" aria-label="Choose annotation color" />
-        </label>
-
-        {/* Stroke width */}
-        {activeTool !== 'text' && activeTool !== 'callout' && activeTool !== 'eraser' && (
-          <div className="flex items-center gap-1 ml-1">
-            <span className="text-[10px] text-white/40">W</span>
-            <input type="range" min={1} max={20} value={strokeWidth}
-              onChange={e => setStrokeWidth(Number(e.target.value))}
-              className="w-16 h-1 bg-white/[0.08] rounded-full appearance-none cursor-pointer
-                [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
-                [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-[#F47B20] [&::-webkit-slider-thumb]:cursor-pointer" />
-            <span className="text-[10px] text-white/40 w-4">{strokeWidth}</span>
+        {/* ── History group ── */}
+        <div className="flex flex-col items-center gap-0.5">
+          <span className="text-[8px] text-white/25 uppercase tracking-wider leading-none">History</span>
+          <div className="flex items-center gap-0.5">
+            <button onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)" aria-label="Undo"
+              className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08] disabled:opacity-20 disabled:pointer-events-none">
+              <Undo2 size={16} />
+            </button>
+            <button onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)" aria-label="Redo"
+              className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08] disabled:opacity-20 disabled:pointer-events-none">
+              <Redo2 size={16} />
+            </button>
           </div>
-        )}
+        </div>
 
-        {/* Eraser controls */}
-        {activeTool === 'eraser' && (
-          <>
-            {/* Mode toggle */}
-            <div className="flex items-center bg-white/[0.06] rounded-md p-0.5 ml-1">
-              <button onClick={() => setEraserMode('partial')} title="Partial erase — only removes what's under cursor"
-                className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-                  eraserMode === 'partial' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white'
-                }`}>Partial</button>
-              <button onClick={() => setEraserMode('object')} title="Object erase — deletes entire annotation on touch"
-                className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${
-                  eraserMode === 'object' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white'
-                }`}>Object</button>
-            </div>
-            {/* Size slider */}
-            <div className="flex items-center gap-1 ml-1">
-              <span className="text-[10px] text-white/40">Size</span>
-              <input type="range" min={5} max={50} value={eraserRadius}
-                onChange={e => setEraserRadius(Number(e.target.value))}
-                className="w-16 h-1 bg-white/[0.08] rounded-full appearance-none cursor-pointer
-                  [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
-                  [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-[#F47B20] [&::-webkit-slider-thumb]:cursor-pointer" />
-              <span className="text-[10px] text-white/40 w-5">{eraserRadius}</span>
-            </div>
-          </>
-        )}
+        <div className="w-px h-8 bg-white/[0.08]" />
 
-        {/* Text/Callout: font family & size */}
-        {(activeTool === 'text' || activeTool === 'callout') && (
-          <>
-            <select value={fontFamily} onChange={e => setFontFamily(e.target.value)}
-              className="ml-1 px-1 py-0.5 text-[10px] bg-dark-surface border border-white/[0.1] rounded text-white max-w-[100px]">
-              {FONT_FAMILIES.map(ff => (
-                <option key={ff} value={ff} style={{ fontFamily: ff }}>{ff}</option>
-              ))}
-            </select>
-            <div className="flex items-center gap-1 ml-1">
-              <span className="text-[10px] text-white/40">Sz</span>
-              <input type="number" min={8} max={72} step={0.5} value={fontSize}
-                onChange={e => setFontSize(Math.max(8, Math.min(72, Number(e.target.value))))}
-                className="w-12 px-1 py-0.5 text-[10px] bg-dark-surface border border-white/[0.1] rounded text-white text-center" />
-            </div>
-          </>
-        )}
-
-        {/* Opacity (not for highlighter or eraser) */}
-        {activeTool !== 'highlighter' && activeTool !== 'eraser' && (
-          <div className="flex items-center gap-1 ml-1">
-            <span className="text-[10px] text-white/40">O</span>
-            <input type="range" min={10} max={100} step={5} value={opacity}
-              onChange={e => setOpacity(Number(e.target.value))}
-              className="w-14 h-1 bg-white/[0.08] rounded-full appearance-none cursor-pointer
-                [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3
-                [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-[#F47B20] [&::-webkit-slider-thumb]:cursor-pointer" />
-            <span className="text-[10px] text-white/40 w-6">{opacity}%</span>
+        {/* ── Rotate group ── */}
+        <div className="flex flex-col items-center gap-0.5">
+          <span className="text-[8px] text-white/25 uppercase tracking-wider leading-none">Rotate</span>
+          <div className="flex items-center gap-0.5">
+            <button onClick={() => rotatePage(-90)} title="Rotate CCW" aria-label="Rotate counter-clockwise"
+              className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08]">
+              <RotateCcw size={16} />
+            </button>
+            <button onClick={() => rotatePage(90)} title="Rotate CW" aria-label="Rotate clockwise"
+              className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08]">
+              <RotateCw size={16} />
+            </button>
           </div>
-        )}
+        </div>
 
-        {/* Straight-line mode toggle */}
-        {(activeTool === 'pencil' || activeTool === 'highlighter') && (
-          <button onClick={() => setStraightLineMode(m => !m)}
-            title={straightLineMode ? 'Straight line mode (click for freehand)' : 'Freehand mode (click for straight)'}
-            className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ml-1 ${
-              straightLineMode
-                ? 'bg-[#F47B20]/20 text-[#F47B20] border border-[#F47B20]/30'
-                : 'text-white/40 hover:text-white/60 border border-white/[0.08]'
-            }`}>
-            {straightLineMode ? 'Straight' : 'Free'}
-          </button>
-        )}
+        <div className="w-px h-8 bg-white/[0.08]" />
 
-        <div className="w-px h-5 bg-white/[0.08] mx-1" />
-
-        {/* Undo / Redo */}
-        <button onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)" aria-label="Undo"
-          className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08] disabled:opacity-20 disabled:pointer-events-none">
-          <Undo2 size={16} />
-        </button>
-        <button onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)" aria-label="Redo"
-          className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08] disabled:opacity-20 disabled:pointer-events-none">
-          <Redo2 size={16} />
-        </button>
-
-        <div className="w-px h-5 bg-white/[0.08] mx-1" />
-
-        {/* Rotation */}
-        <button onClick={() => rotatePage(-90)} title="Rotate CCW" aria-label="Rotate counter-clockwise"
-          className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08]">
-          <RotateCcw size={16} />
-        </button>
-        <button onClick={() => rotatePage(90)} title="Rotate CW" aria-label="Rotate clockwise"
-          className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08]">
-          <RotateCw size={16} />
-        </button>
-
-        <div className="w-px h-5 bg-white/[0.08] mx-1" />
-
-        {/* Zoom */}
-        <button onClick={() => setZoom(z => Math.round(Math.max(0.25, z - 0.25) * 100) / 100)} title="Zoom out" aria-label="Zoom out"
-          className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08]">
-          <ZoomOut size={16} />
-        </button>
-        <span className="text-[11px] text-white/50 w-10 text-center">{zoomPct}%</span>
-        <button onClick={() => setZoom(z => Math.round(Math.min(4.0, z + 0.25) * 100) / 100)} title="Zoom in" aria-label="Zoom in"
-          className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08]">
-          <ZoomIn size={16} />
-        </button>
-        <button onClick={fitToWindow} title="Fit to window" aria-label="Fit to window"
-          className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08]">
-          <Maximize size={16} />
-        </button>
+        {/* ── Zoom group ── */}
+        <div className="flex flex-col items-center gap-0.5">
+          <span className="text-[8px] text-white/25 uppercase tracking-wider leading-none">Zoom</span>
+          <div className="flex items-center gap-0.5">
+            <button onClick={() => setZoom(z => Math.round(Math.max(0.25, z - 0.25) * 100) / 100)} title="Zoom out" aria-label="Zoom out"
+              className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08]">
+              <ZoomOut size={16} />
+            </button>
+            <span className="text-[11px] text-white/50 w-10 text-center">{zoomPct}%</span>
+            <button onClick={() => setZoom(z => Math.round(Math.min(4.0, z + 0.25) * 100) / 100)} title="Zoom in" aria-label="Zoom in"
+              className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08]">
+              <ZoomIn size={16} />
+            </button>
+            <button onClick={fitToWindow} title="Fit to window" aria-label="Fit to window"
+              className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-white/[0.08]">
+              <Maximize size={16} />
+            </button>
+          </div>
+        </div>
 
         <div className="flex-1" />
 
@@ -2479,9 +2867,88 @@ export default function PdfAnnotateTool() {
         )}
         <div className="flex items-center gap-1 text-[10px] text-white/25">
           <span>{(annotations[currentPage] || []).length} annotations</span>
+          {(measurements[currentPage] || []).length > 0 && (
+            <span>· {(measurements[currentPage] || []).length} measurements</span>
+          )}
           <span>· Ctrl+scroll to zoom</span>
         </div>
       </div>
+
+      {/* ── Calibration modal ───────────────────────── */}
+      <Modal open={calibrateModalOpen} onClose={() => setCalibrateModalOpen(false)} title="Calibrate Measurement" width="sm">
+        {(() => {
+          const m = calibrateMeasureId
+            ? (measurements[currentPage] || []).find(ms => ms.id === calibrateMeasureId)
+            : null
+          const pxDist = m ? Math.hypot(m.endPt.x - m.startPt.x, m.endPt.y - m.startPt.y) : 0
+          return (
+            <div className="flex flex-col gap-4">
+              <p className="text-sm text-white/60">
+                This measurement is <span className="text-white font-medium">{pxDist.toFixed(1)} px</span>.
+                Enter the real-world distance it represents:
+              </p>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min={0.01}
+                  step="any"
+                  value={calibrateValue}
+                  onChange={e => setCalibrateValue(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') {
+                      const val = parseFloat(calibrateValue)
+                      if (val > 0 && pxDist > 0) {
+                        setCalibration({ pixelsPerUnit: pxDist / val, unit: calibrateUnit })
+                        setCalibrateModalOpen(false)
+                      }
+                    }
+                  }}
+                  placeholder="e.g. 12"
+                  className="flex-1 px-3 py-2 text-sm bg-dark-surface border border-white/[0.1] rounded-lg text-white placeholder:text-white/30 focus:outline-none focus:border-[#F47B20]/50"
+                  autoFocus
+                />
+                <select
+                  value={calibrateUnit}
+                  onChange={e => setCalibrateUnit(e.target.value)}
+                  className="px-2 py-2 text-sm bg-dark-surface border border-white/[0.1] rounded-lg text-white"
+                >
+                  <option value="in">inches</option>
+                  <option value="ft">feet</option>
+                  <option value="mm">mm</option>
+                  <option value="cm">cm</option>
+                  <option value="m">meters</option>
+                </select>
+              </div>
+              <div className="flex items-center justify-between">
+                {calibration.pixelsPerUnit !== null && (
+                  <button
+                    onClick={() => {
+                      setCalibration({ pixelsPerUnit: null, unit: 'in' })
+                      setCalibrateModalOpen(false)
+                    }}
+                    className="text-xs text-red-400 hover:text-red-300 transition-colors"
+                  >
+                    Reset Calibration
+                  </button>
+                )}
+                <div className="flex-1" />
+                <button
+                  onClick={() => {
+                    const val = parseFloat(calibrateValue)
+                    if (val > 0 && pxDist > 0) {
+                      setCalibration({ pixelsPerUnit: pxDist / val, unit: calibrateUnit })
+                      setCalibrateModalOpen(false)
+                    }
+                  }}
+                  className="px-4 py-1.5 text-sm bg-[#F47B20] text-white rounded-lg hover:bg-[#F47B20]/80 transition-colors"
+                >
+                  Apply
+                </button>
+              </div>
+            </div>
+          )
+        })()}
+      </Modal>
     </div>
   )
 }

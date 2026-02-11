@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import type { ButtonHTMLAttributes, ReactNode } from 'react'
 
 type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger'
@@ -38,7 +39,7 @@ const sizes: Record<ButtonSize, string> = {
   lg: 'h-11 px-6 text-sm rounded-lg gap-2',
 }
 
-export function Button({
+export const Button = memo(function Button({
   variant = 'primary',
   size = 'md',
   icon,
@@ -65,4 +66,4 @@ export function Button({
       {children}
     </button>
   )
-}
+})

@@ -84,6 +84,7 @@ export async function exportFillablePDF(doc: FormDocument) {
         })
         // Create text field
         const tf = form.createTextField(uniqueName(el.label))
+        tf.setFontSize(10)
         tf.addToPage(page, { x, y, width: w, height: h - 14, borderWidth: 0.5 })
         break
       }
@@ -94,6 +95,7 @@ export async function exportFillablePDF(doc: FormDocument) {
         })
         const tf = form.createTextField(uniqueName(el.label))
         tf.enableMultiline()
+        tf.setFontSize(10)
         tf.addToPage(page, { x, y, width: w, height: h - 14, borderWidth: 0.5 })
         break
       }
@@ -130,6 +132,7 @@ export async function exportFillablePDF(doc: FormDocument) {
         })
         const dd = form.createDropdown(uniqueName(el.label))
         dd.setOptions(el.options ?? [])
+        dd.setFontSize(10)
         dd.addToPage(page, { x, y, width: w, height: h - 14, borderWidth: 0.5 })
         break
       }
@@ -139,6 +142,7 @@ export async function exportFillablePDF(doc: FormDocument) {
           x, y: y + h - 10, size: 8, font, color: rgb(0.3, 0.3, 0.3),
         })
         const tf = form.createTextField(uniqueName(el.label + '_date'))
+        tf.setFontSize(10)
         tf.addToPage(page, { x, y, width: w, height: h - 14, borderWidth: 0.5 })
         break
       }
@@ -549,7 +553,7 @@ export function importJSON(jsonStr: string): FormDocument {
   }
 
   return {
-    id: (obj.id as string) || Math.random().toString(36).substring(2, 11),
+    id: (obj.id as string) || crypto.randomUUID(),
     title: obj.title as string,
     pageSize: (obj.pageSize === 'a4' ? 'a4' : 'letter'),
     pageCount: typeof obj.pageCount === 'number' ? Math.max(1, obj.pageCount) : 1,

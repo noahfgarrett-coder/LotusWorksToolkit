@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
 import { FileDropZone } from '@/components/common/FileDropZone.tsx'
 import { Button } from '@/components/common/Button.tsx'
 import { ProgressBar } from '@/components/common/ProgressBar.tsx'
+import { useAppStore } from '@/stores/appStore.ts'
 import { loadPDFFile, generateThumbnail, mergePDFs, removePDFFromCache } from '@/utils/pdf.ts'
 import { downloadBlob } from '@/utils/download.ts'
 import { formatFileSize } from '@/utils/fileReader.ts'
@@ -217,6 +218,7 @@ export default function PdfMergeTool() {
   const filesRef = useRef(files)
   filesRef.current = files
   const loadingThumbs = useRef(new Set<string>())
+  const MAX_LOADING_THUMBS = 1000
 
   // Memory estimation
   const MAX_MEMORY_MB = 4096
@@ -240,6 +242,11 @@ export default function PdfMergeTool() {
 
   const loadPageThumbnail = useCallback(async (fileId: string, pageUid: string, pageNumber: number) => {
     if (loadingThumbs.current.has(pageUid)) return
+    // Evict oldest entries if Set exceeds max size
+    if (loadingThumbs.current.size >= MAX_LOADING_THUMBS) {
+      const iter = loadingThumbs.current.values()
+      for (let i = 0; i < 100; i++) loadingThumbs.current.delete(iter.next().value!)
+    }
     loadingThumbs.current.add(pageUid)
 
     const file = filesRef.current.find((f) => f.id === fileId)
@@ -251,8 +258,7 @@ export default function PdfMergeTool() {
         if (f.id !== fileId) return f
         return { ...f, pages: f.pages.map((p) => p.uid === pageUid ? { ...p, thumbnail } : p) }
       }))
-    } catch (err) {
-      console.error(`[PDF] Thumbnail gen failed for page ${pageNumber}:`, err)
+    } catch {
       loadingThumbs.current.delete(pageUid)
     }
   }, [])
@@ -276,8 +282,8 @@ export default function PdfMergeTool() {
             expanded: false,
             loadingPages: false,
           })
-        } catch (err) {
-          console.error(`Failed to load ${file.name}:`, err)
+        } catch {
+          useAppStore.getState().addToast({ type: 'error', message: `Failed to load ${file.name}` })
         }
       }
       setFiles((prev) => [...prev, ...pdfFiles])

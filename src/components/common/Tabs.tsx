@@ -1,3 +1,5 @@
+import { memo } from 'react'
+
 interface Tab {
   id: string
   label: string
@@ -10,7 +12,7 @@ interface TabsProps {
   className?: string
 }
 
-export function Tabs({ tabs, activeTab, onChange, className = '' }: TabsProps) {
+export const Tabs = memo(function Tabs({ tabs, activeTab, onChange, className = '' }: TabsProps) {
   return (
     <div className={`flex gap-1 p-1 bg-white/[0.04] rounded-lg ${className}`}>
       {tabs.map((tab) => (
@@ -30,4 +32,4 @@ export function Tabs({ tabs, activeTab, onChange, className = '' }: TabsProps) {
       ))}
     </div>
   )
-}
+})

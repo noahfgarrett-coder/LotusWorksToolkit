@@ -5,6 +5,7 @@ import { Slider } from '@/components/common/Slider.tsx'
 import { ColorPicker } from '@/components/common/ColorPicker.tsx'
 import { Tabs } from '@/components/common/Tabs.tsx'
 import { downloadCanvas } from '@/utils/download.ts'
+import { useAppStore } from '@/stores/appStore.ts'
 import { Download, Copy, QrCode } from 'lucide-react'
 
 type InputType = 'text' | 'url' | 'email' | 'wifi'
@@ -82,7 +83,7 @@ export default function QrCodeTool() {
       })
       await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
     } catch {
-      // Clipboard API may not be available or blob creation failed
+      useAppStore.getState().addToast({ type: 'error', message: 'Failed to copy to clipboard' })
     }
   }
 

@@ -13,16 +13,20 @@ import { marked, type Token } from 'marked'
 import { readFileAsDataURL } from '@/utils/fileReader.ts'
 import { loadImage, resizeImage, canvasToBlob } from '@/utils/imageProcessing.ts'
 
-// ── PDF.js worker setup (mirrors compression.ts) ──────────────────
+// Centralized PDF.js worker setup (side-effect import)
+import '@/utils/pdfWorkerSetup.ts'
 
-try {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-    'pdfjs-dist/build/pdf.worker.min.mjs',
-    import.meta.url,
-  ).toString()
-} catch {
-  // Worker may already be configured via pdf.ts
-}
+// ── Hoisted regex constants ───────────────────────────────────────
+
+const FORMULA_INJECT_RE = /^[=+\-@\t\r]/
+const SCRIPT_RE = /<script[\s\S]*?(<\/script>|$)/gi
+const IFRAME_RE = /<iframe[\s\S]*?(<\/iframe>|$)/gi
+const OBJECT_RE = /<object[\s\S]*?(<\/object>|$)/gi
+const EMBED_RE = /<embed[^>]*\/?>/gi
+const EVENT_HANDLER_DQ_RE = /\s+on\w+\s*=\s*"[^"]*"/gi
+const EVENT_HANDLER_SQ_RE = /\s+on\w+\s*=\s*'[^']*'/gi
+const EVENT_HANDLER_UQ_RE = /\s+on\w+\s*=\s*[^\s>"']+/gi
+const JS_PROTOCOL_RE = /(href|src|action)\s*=\s*["']?\s*javascript:/gi
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -445,7 +449,7 @@ function jsonArrayToRows(data: Record<string, unknown>[]): { headers: string[]; 
 function serializeDelimited(headers: string[], rows: string[][], delimiter: string): string {
   const escape = (val: string) => {
     // Guard against CSV formula injection — prefix trigger chars with a single quote
-    const needsFormulaGuard = /^[=+\-@\t\r]/.test(val)
+    const needsFormulaGuard = FORMULA_INJECT_RE.test(val)
     const safeVal = needsFormulaGuard ? `'${val}` : val
     if (safeVal.includes(delimiter) || safeVal.includes('"') || safeVal.includes('\n')) {
       return `"${safeVal.replace(/"/g, '""')}"`
@@ -906,16 +910,16 @@ function wrapTextLines(text: string, maxChars: number): string[] {
 function sanitizeHtml(html: string): string {
   // Strip dangerous tags (including self-closing and unclosed variants)
   let safe = html
-  safe = safe.replace(/<script[\s\S]*?(<\/script>|$)/gi, '')
-  safe = safe.replace(/<iframe[\s\S]*?(<\/iframe>|$)/gi, '')
-  safe = safe.replace(/<object[\s\S]*?(<\/object>|$)/gi, '')
-  safe = safe.replace(/<embed[^>]*\/?>/gi, '')
+  safe = safe.replace(SCRIPT_RE, '')
+  safe = safe.replace(IFRAME_RE, '')
+  safe = safe.replace(OBJECT_RE, '')
+  safe = safe.replace(EMBED_RE, '')
   // Strip event handlers (quoted and unquoted)
-  safe = safe.replace(/\s+on\w+\s*=\s*"[^"]*"/gi, '')
-  safe = safe.replace(/\s+on\w+\s*=\s*'[^']*'/gi, '')
-  safe = safe.replace(/\s+on\w+\s*=\s*[^\s>"']+/gi, '')
+  safe = safe.replace(EVENT_HANDLER_DQ_RE, '')
+  safe = safe.replace(EVENT_HANDLER_SQ_RE, '')
+  safe = safe.replace(EVENT_HANDLER_UQ_RE, '')
   // Strip javascript: protocol in href/src/action attributes
-  safe = safe.replace(/(href|src|action)\s*=\s*["']?\s*javascript:/gi, '$1="')
+  safe = safe.replace(JS_PROTOCOL_RE, '$1="')
   return safe
 }
 

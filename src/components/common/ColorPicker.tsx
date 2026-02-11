@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, memo } from 'react'
 
 interface ColorPickerProps {
   value: string
@@ -12,7 +12,9 @@ const defaultPresets = [
   '#EAB308', '#22C55E', '#3B82F6', '#8B5CF6', '#EC4899',
 ]
 
-export function ColorPicker({
+const HEX_PATTERN = /^#[0-9a-fA-F]{0,6}$/
+
+export const ColorPicker = memo(function ColorPicker({
   value,
   onChange,
   label,
@@ -70,7 +72,7 @@ export function ColorPicker({
           value={value}
           onChange={(e) => {
             const v = e.target.value
-            if (/^#[0-9a-fA-F]{0,6}$/.test(v)) onChange(v)
+            if (HEX_PATTERN.test(v)) onChange(v)
           }}
           className="w-full px-2 py-1 text-xs bg-dark-surface border border-white/[0.1] rounded-md text-white focus:outline-none focus:border-[#F47B20]/40"
           placeholder="#000000"
@@ -78,4 +80,4 @@ export function ColorPicker({
       )}
     </div>
   )
-}
+})

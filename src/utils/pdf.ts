@@ -8,15 +8,8 @@ import { PDFDocument } from 'pdf-lib'
 import * as pdfjsLib from 'pdfjs-dist'
 import type { PDFFile, PDFPage, PageRangeValidation } from '@/types'
 
-// Set up PDF.js worker
-try {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-    'pdfjs-dist/build/pdf.worker.min.mjs',
-    import.meta.url,
-  ).toString()
-} catch (error) {
-  console.error('[PDF] Failed to set up PDF.js worker:', error)
-}
+// Centralized PDF.js worker setup (side-effect import)
+import '@/utils/pdfWorkerSetup.ts'
 
 // Simple LRU cache for loaded PDF.js documents (max 10)
 interface CachedDoc {
@@ -59,7 +52,7 @@ async function getCachedDoc(fileId: string, data: Uint8Array): Promise<pdfjsLib.
 }
 
 export function generateId(): string {
-  return Math.random().toString(36).substring(2, 11)
+  return crypto.randomUUID()
 }
 
 /**
@@ -474,21 +467,27 @@ export async function hasEmbeddedText(
 export async function extractPositionedText(
   pdfFile: PDFFile,
   pageNumber: number,
-): Promise<{ text: string; x: number; y: number; width: number; height: number; page: number }[]> {
+): Promise<{
+  items: { text: string; x: number; y: number; width: number; height: number; page: number }[]
+  viewport: { width: number; height: number }
+}> {
   const doc = await getCachedDoc(pdfFile.id, pdfFile.data)
   const page = await doc.getPage(pageNumber)
   const viewport = page.getViewport({ scale: 1 })
   const content = await page.getTextContent()
-  return content.items
-    .filter((item: any) => 'str' in item && item.str.trim())
-    .map((item: any) => ({
+  const items: { text: string; x: number; y: number; width: number; height: number; page: number }[] = []
+  for (const item of content.items) {
+    if (!('str' in item) || !item.str.trim()) continue
+    items.push({
       text: item.str,
       x: item.transform[4],
       y: viewport.height - item.transform[5],
       width: item.width ?? 0,
       height: Math.abs(item.transform[0]) || 12,
       page: pageNumber,
-    }))
+    })
+  }
+  return { items, viewport: { width: viewport.width, height: viewport.height } }
 }
 
 // ============================================

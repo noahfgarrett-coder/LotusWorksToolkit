@@ -1,3 +1,5 @@
+import { memo } from 'react'
+
 interface ProgressBarProps {
   value: number
   max?: number
@@ -6,7 +8,7 @@ interface ProgressBarProps {
   className?: string
 }
 
-export function ProgressBar({
+export const ProgressBar = memo(function ProgressBar({
   value,
   max = 100,
   label,
@@ -33,4 +35,4 @@ export function ProgressBar({
       </div>
     </div>
   )
-}
+})

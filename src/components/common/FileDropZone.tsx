@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, type DragEvent } from 'react'
+import { useState, useCallback, useRef, memo, type DragEvent } from 'react'
 import { Upload } from 'lucide-react'
 
 interface FileDropZoneProps {
@@ -11,7 +11,7 @@ interface FileDropZoneProps {
   className?: string
 }
 
-export function FileDropZone({
+export const FileDropZone = memo(function FileDropZone({
   onFiles,
   accept,
   multiple = true,
@@ -93,4 +93,4 @@ export function FileDropZone({
       />
     </div>
   )
-}
+})

@@ -3,6 +3,7 @@ import { useAppStore } from '@/stores/appStore.ts'
 import { AppShell } from '@/components/layout/AppShell.tsx'
 import { ToolContainer } from '@/components/layout/ToolContainer.tsx'
 import { WelcomeScreen } from '@/components/WelcomeScreen.tsx'
+import { ErrorBoundary } from '@/components/common/ErrorBoundary.tsx'
 import type { ToolId } from '@/types/index.ts'
 
 // Lazy-load each tool
@@ -41,9 +42,11 @@ export default function App() {
     <AppShell>
       {ActiveComponent ? (
         <ToolContainer key={activeTool}>
-          <Suspense fallback={<LoadingFallback />}>
-            <ActiveComponent />
-          </Suspense>
+          <ErrorBoundary>
+            <Suspense fallback={<LoadingFallback />}>
+              <ActiveComponent />
+            </Suspense>
+          </ErrorBoundary>
         </ToolContainer>
       ) : (
         <WelcomeScreen />

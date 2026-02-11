@@ -13,7 +13,7 @@ import type { PDFFile } from '@/types'
 import {
   FileText, Copy, RotateCcw, ZoomIn, ZoomOut,
   ChevronLeft, ChevronRight, Table2, AlignLeft,
-  Crop, Globe, ChevronDown, Layers, X,
+  Crop, Globe, ChevronDown, Layers, X, Trash2,
 } from 'lucide-react'
 
 // ── Types ──────────────────────────────────────────
@@ -59,7 +59,7 @@ const RENDER_SCALE = 1.5
 // ── Utility: generate unique ID ────────────────────
 
 function genId(): string {
-  return Math.random().toString(36).slice(2, 10)
+  return crypto.randomUUID()
 }
 
 // ── Region hit test ────────────────────────────────
@@ -240,25 +240,50 @@ function finalizeTable(tableRows: string[][]): TableData {
 
   // Header detection
   const headers = filtered[0]
-  const dataRows = filtered.slice(1)
-  const firstRowAllNum = headers.every(h => /^\s*[\d.,\-$%]+\s*$/.test(h) || !h.trim())
+  const isNumeric = (s: string) => /^\s*[\d.,\-$%]+\s*$/.test(s)
+  const firstRowAllNum = headers.every(h => isNumeric(h) || !h.trim())
   if (firstRowAllNum) {
     return {
       headers: Array(cols).fill('').map((_, i) => `Col ${String.fromCharCode(65 + (i % 26))}`),
       rows: filtered,
     }
   }
-  return { headers, rows: dataRows }
+
+  // Detect two-row header: row 0 has an empty first cell that row 1 fills with
+  // a label, and row 1 has repeated values (sub-header labels like years/units)
+  if (filtered.length >= 3) {
+    const row1 = filtered[1]
+    if (!headers[0].trim() && row1[0]?.trim() && !isNumeric(row1[0])) {
+      const row1Values = row1.map(c => c.trim()).filter(Boolean)
+      const hasRepeats = new Set(row1Values).size < row1Values.length
+      if (hasRepeats) {
+        const merged = headers.map((h, i) => {
+          const h0 = h.trim()
+          const h1 = row1[i]?.trim() ?? ''
+          if (h0 && h1) return `${h0} ${h1}`
+          return h0 || h1
+        })
+        return { headers: merged, rows: filtered.slice(2) }
+      }
+    }
+  }
+
+  return { headers, rows: filtered.slice(1) }
 }
 
 // ── PRIMARY: Line-based table extraction ──────────
 // When the PDF has drawn rules/borders, use them as column + row boundaries.
 // Filters out short lines (cell/rectangle edges) and clips text to the table bounds.
 
+interface LineTableResult {
+  data: TableData
+  bounds: { top: number; bottom: number }
+}
+
 function buildTableFromLines(
   items: PositionedText[],
   lines: { horizontal: PageLine[]; vertical: PageLine[] },
-): TableData | null {
+): LineTableResult | null {
   if (lines.vertical.length < 2) return null
 
   // 1. Determine rough table Y extent from horizontal lines
@@ -336,13 +361,14 @@ function buildTableFromLines(
 
   const tableRows = assignToGrid(rawRows, colBounds)
   const merged = mergeWrappedRows(tableRows)
-  return finalizeTable(merged)
+  const data = finalizeTable(merged)
+  return data.headers.length > 0 ? { data, bounds: { top: tableTop, bottom: tableBottom } } : null
 }
 
 // ── FALLBACK: Histogram-based table extraction ────
 // When no drawn lines exist, detect columns from X-position density.
 
-function buildTableFromHistogram(items: PositionedText[]): TableData {
+function buildTableFromHistogram(items: PositionedText[], tablesOnly?: boolean): TableData {
   if (items.length === 0) return { headers: [], rows: [] }
 
   const avgH = items.reduce((s, i) => s + i.height, 0) / items.length
@@ -391,27 +417,108 @@ function buildTableFromHistogram(items: PositionedText[]): TableData {
     return finalizeTable(rawRows.map(row => [row.map(i => i.text).join(' ')]))
   }
 
-  const tableRows = assignToGrid(rawRows, colBounds)
-  const merged = mergeWrappedRows(tableRows)
-  return finalizeTable(merged)
+  // ── Classify rows: table rows touch 3+ columns, text rows touch fewer ──
+  function getCol(x: number): number {
+    for (let c = 0; c < colBounds.length; c++) {
+      if (x < colBounds[c]) return c
+    }
+    return colBounds.length
+  }
+
+  const rowIsTable = rawRows.map(row => {
+    const usedCols = new Set(row.map(item => getCol(item.x)))
+    return usedCols.size >= 3
+  })
+
+  const firstTableIdx = rowIsTable.indexOf(true)
+  const lastTableIdx = rowIsTable.lastIndexOf(true)
+
+  // No multi-column rows → treat as single-column document
+  if (firstTableIdx === -1) {
+    return finalizeTable(rawRows.map(row => [row.map(i => i.text).join(' ')]))
+  }
+
+  // Build the table from the contiguous table region only
+  const tableBody = rawRows.slice(firstTableIdx, lastTableIdx + 1)
+  const tableGridRows = assignToGrid(tableBody, colBounds)
+  const merged = mergeWrappedRows(tableGridRows)
+  const table = finalizeTable(merged)
+  if (table.headers.length === 0) return table
+
+  if (tablesOnly) return table
+
+  // Collect non-table text above and below the table region
+  const numCols = table.headers.length
+  const prefixRows = rawRows.slice(0, firstTableIdx)
+  const suffixRows = rawRows.slice(lastTableIdx + 1)
+
+  // Table data first, then all non-table text underneath
+  const allRows: string[][] = [...table.rows]
+
+  const extraRows = [...prefixRows, ...suffixRows]
+  for (const row of extraRows) {
+    const text = row.map(i => i.text).join(' ').trim()
+    if (!text) continue
+    const cells: string[] = Array(numCols).fill('')
+    cells[0] = text
+    allRows.push(cells)
+  }
+
+  return { headers: table.headers, rows: allRows }
 }
 
 // ── Unified entry point ──────────────────────────
 
+/** Add non-table text items as column-0 rows around the core table data. */
+function addNonTableText(
+  items: PositionedText[],
+  table: TableData,
+  bounds: { top: number; bottom: number },
+): TableData {
+  const numCols = table.headers.length
+  if (numCols === 0) return table
+
+  const aboveItems = items.filter(i => i.y + i.height < bounds.top)
+  const belowItems = items.filter(i => i.y > bounds.bottom)
+
+  const toRows = (group: PositionedText[]): string[][] => {
+    const rows = clusterIntoRows(group)
+    const result: string[][] = []
+    for (const row of rows) {
+      const text = row.map(i => i.text).join(' ').trim()
+      if (!text) continue
+      const cells: string[] = Array(numCols).fill('')
+      cells[0] = text
+      result.push(cells)
+    }
+    return result
+  }
+
+  const prefix = toRows(aboveItems)
+  const suffix = toRows(belowItems)
+
+  if (prefix.length === 0 && suffix.length === 0) return table
+  // Table data first, then all non-table text underneath
+  return { headers: table.headers, rows: [...table.rows, ...prefix, ...suffix] }
+}
+
 function buildTableData(
   items: PositionedText[],
   lines?: { horizontal: PageLine[]; vertical: PageLine[] },
+  tablesOnly?: boolean,
 ): TableData {
   if (items.length === 0) return { headers: [], rows: [] }
 
   // Try line-based detection first (most accurate)
   if (lines && (lines.vertical.length >= 2 || lines.horizontal.length >= 2)) {
     const result = buildTableFromLines(items, lines)
-    if (result && result.headers.length > 1) return result
+    if (result && result.data.headers.length > 1) {
+      return tablesOnly ? result.data : addNonTableText(items, result.data, result.bounds)
+    }
   }
 
   // Fallback to histogram-based detection
-  return buildTableFromHistogram(items)
+  return buildTableFromHistogram(items, tablesOnly)
 }
 
 // ── Document layout extraction ─────────────────────
@@ -509,6 +616,7 @@ export default function TextExtractTool() {
   const [progressMsg, setProgressMsg] = useState('')
   const [useOcr, setUseOcr] = useState(false)
   const [ocrDetected, setOcrDetected] = useState(false)
+  const [tablesOnly, setTablesOnly] = useState(false)
 
   // Extracted data
   const [extractedItems, setExtractedItems] = useState<PositionedText[]>([])
@@ -540,6 +648,7 @@ export default function TextExtractTool() {
 
   // Page dimensions (doc-space)
   const [pageDims, setPageDims] = useState<{ width: number; height: number }>({ width: 612, height: 792 })
+  const [pageDimsByPage, setPageDimsByPage] = useState<Record<number, { width: number; height: number }>>({})
 
   // ── File loading ─────────────────────────────────
 
@@ -554,6 +663,7 @@ export default function TextExtractTool() {
       setExtractedItems([])
       setTableData(null)
       setDocPlainText('')
+      setPageDimsByPage({})
       setRegions([])
       setRegionToolActive(false)
 
@@ -727,7 +837,7 @@ export default function TextExtractTool() {
 
   // ── Extraction pipeline ──────────────────────────
 
-  /** Extract a single page and return its items + lines */
+  /** Extract a single page and return its items, lines, and viewport dimensions */
   const extractPage = useCallback(async (
     pdf: PDFFile,
     pageNum: number,
@@ -735,14 +845,17 @@ export default function TextExtractTool() {
   ) => {
     const items: PositionedText[] = []
     const lines: { horizontal: PageLine[]; vertical: PageLine[] } = { horizontal: [], vertical: [] }
+    let viewport = { width: pageDims.width, height: pageDims.height }
 
     let pageItems: PositionedText[]
     if (useOcr) {
       const canvas = ocrCanvasRef.current
-      if (!canvas) return { items, lines }
+      if (!canvas) return { items, lines, viewport }
       pageItems = await ocrPositionedText(pdf, pageNum, language, canvas, onProgress)
     } else {
-      pageItems = await extractPositionedText(pdf, pageNum)
+      const result = await extractPositionedText(pdf, pageNum)
+      pageItems = result.items
+      viewport = result.viewport
     }
 
     // Extract drawn lines/rules for table grid detection
@@ -771,8 +884,8 @@ export default function TextExtractTool() {
       : pageItems
     items.push(...filtered)
 
-    return { items, lines }
-  }, [useOcr, language, regions])
+    return { items, lines, viewport }
+  }, [useOcr, language, regions, pageDims])
 
   const handleExtract = useCallback(async (scope: 'page' | 'all' = 'page') => {
     if (!pdfFile) return
@@ -785,14 +898,7 @@ export default function TextExtractTool() {
       // Determine pages to process
       let pagesToProcess: number[]
       if (scope === 'page') {
-        // Current page only (or pages with regions if regions exist on current page)
-        const currentPageRegions = regions.filter(r => r.page === currentPage)
-        if (regions.length > 0 && currentPageRegions.length === 0) {
-          // Regions exist but not on current page — just extract current page unfiltered
-          pagesToProcess = [currentPage]
-        } else {
-          pagesToProcess = [currentPage]
-        }
+        pagesToProcess = [currentPage]
       } else {
         // All pages — when regions exist, only pages with regions
         pagesToProcess = regions.length > 0
@@ -807,18 +913,20 @@ export default function TextExtractTool() {
         const allItems: PositionedText[] = []
         let combinedTable: TableData | null = null
         const allDocTexts: string[] = []
+        const dims: Record<number, { width: number; height: number }> = {}
 
         for (let pi = 0; pi < processCount; pi++) {
           const p = pagesToProcess[pi]
           setProgressMsg(`Page ${p} (${pi + 1}/${processCount})...`)
 
-          const { items, lines } = await extractPage(pdfFile, p, (prog) => {
+          const { items, lines, viewport } = await extractPage(pdfFile, p, (prog) => {
             setProgress(Math.round(((pi + prog) / processCount) * 100))
           })
           allItems.push(...items)
+          dims[p] = viewport
 
           // Build table for this page
-          const pageTable = buildTableData(items, lines)
+          const pageTable = buildTableData(items, lines, tablesOnly)
 
           // Build doc text for this page
           const docLines = buildDocumentLines(items)
@@ -854,30 +962,35 @@ export default function TextExtractTool() {
         setExtractedItems(allItems)
         setTableData(combinedTable ?? { headers: [], rows: [] })
         setDocPlainText(allDocTexts.join('\n\n---\n\n'))
+        setPageDimsByPage(dims)
       } else {
         // ── Single page extraction ──
         const p = pagesToProcess[0]
         setProgressMsg(processCount === 1 ? `Extracting page ${p}...` : `Page ${p}...`)
 
-        const { items, lines } = await extractPage(pdfFile, p, (prog) => {
+        const { items, lines, viewport } = await extractPage(pdfFile, p, (prog) => {
           setProgress(Math.round(prog * 100))
         })
 
         setExtractedItems(items)
-        setTableData(buildTableData(items, lines))
+        setTableData(buildTableData(items, lines, tablesOnly))
         const docLines = buildDocumentLines(items)
         setDocPlainText(docLinesToPlainText(docLines))
+        setPageDimsByPage({ [p]: viewport })
         setProgress(100)
       }
 
       setProgressMsg('Done!')
+      setProgress(100)
+      // Brief pause so user sees completion feedback (non-OCR extraction is near-instant)
+      await new Promise<void>(r => setTimeout(r, 600))
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error'
       setExtractError(`Extraction failed: ${msg}`)
     } finally {
       setIsExtracting(false)
     }
-  }, [pdfFile, useOcr, language, regions, currentPage, extractPage])
+  }, [pdfFile, useOcr, language, regions, currentPage, extractPage, tablesOnly])
 
   // ── Export functions ─────────────────────────────
 
@@ -1177,6 +1290,19 @@ export default function TextExtractTool() {
           </button>
         </div>
 
+        {/* Tables only toggle (table mode only) */}
+        {extractionMode === 'table' && (
+          <button
+            onClick={() => setTablesOnly(prev => !prev)}
+            title="Tables only — exclude non-table text (titles, paragraphs)"
+            className={`flex items-center gap-1 px-2 py-0.5 rounded text-[10px] transition-colors ${
+              tablesOnly ? 'bg-blue-500/30 text-blue-300 ring-1 ring-blue-400/50' : 'text-white/50 hover:text-white hover:bg-white/[0.06]'
+            }`}
+          >
+            <Table2 size={10} /> Tables only
+          </button>
+        )}
+
         {/* Language (OCR only) */}
         {ocrDetected && (
           <>
@@ -1288,6 +1414,22 @@ export default function TextExtractTool() {
           </button>
         )}
 
+        {/* Clear extracted data */}
+        {hasData && (
+          <button
+            onClick={() => {
+              setExtractedItems([])
+              setTableData(null)
+              setDocPlainText('')
+              setPageDimsByPage({})
+            }}
+            title="Clear extracted data"
+            className="flex items-center gap-1 px-2 py-1 text-[10px] rounded text-white/30 hover:text-red-400 hover:bg-white/[0.06] transition-colors"
+          >
+            <Trash2 size={10} /> Clear
+          </button>
+        )}
+
         {/* New */}
         <button
           onClick={() => {
@@ -1295,6 +1437,7 @@ export default function TextExtractTool() {
             setExtractedItems([])
             setTableData(null)
             setDocPlainText('')
+            setPageDimsByPage({})
             setRegions([])
           }}
           className="flex items-center gap-1 px-2 py-1 text-[10px] rounded text-white/30 hover:text-white hover:bg-white/[0.06] transition-colors"
@@ -1428,7 +1571,7 @@ export default function TextExtractTool() {
                           {row.map((cell, ci) => (
                             <td
                               key={ci}
-                              className={`px-3 py-1.5 text-xs border border-white/[0.06] whitespace-nowrap ${
+                              className={`px-3 py-1.5 text-xs border border-white/[0.06] max-w-[300px] break-words ${
                                 /^\s*[\d.,\-$%]+\s*$/.test(cell) ? 'text-right text-white/70' : 'text-white/60'
                               }`}
                             >
@@ -1445,36 +1588,52 @@ export default function TextExtractTool() {
                 </div>
               </div>
             ) : (
-              /* Document preview — layout faithful */
+              /* Document preview — per-page layout */
               <div className="p-4 overflow-auto h-full">
-                <div
-                  className="relative bg-white rounded shadow-lg"
-                  style={{
-                    width: pageDims.width,
-                    minHeight: pageDims.height,
-                    transform: `scale(${rightZoom})`,
-                    transformOrigin: 'top left',
-                  }}
-                >
-                  {extractedItems.map((item, i) => (
-                    <span
-                      key={i}
-                      className="absolute text-black whitespace-nowrap"
-                      style={{
-                        left: item.x,
-                        top: item.y,
-                        fontSize: Math.max(8, item.height * 0.9),
-                        lineHeight: 1,
-                      }}
-                    >
-                      {item.text}
-                    </span>
-                  ))}
-                  {extractedItems.length === 0 && (
-                    <div className="flex items-center justify-center h-full text-gray-400 text-sm">
-                      No text found
-                    </div>
-                  )}
+                <div style={{ transform: `scale(${rightZoom})`, transformOrigin: 'top left' }}>
+                  {(() => {
+                    const pages = new Map<number, PositionedText[]>()
+                    for (const item of extractedItems) {
+                      const list = pages.get(item.page) ?? []
+                      list.push(item)
+                      pages.set(item.page, list)
+                    }
+                    const sortedPages = [...pages.entries()].sort(([a], [b]) => a - b)
+
+                    return sortedPages.length > 0 ? sortedPages.map(([pageNum, items]) => {
+                      const dims = pageDimsByPage[pageNum] ?? pageDims
+                      return (
+                        <div key={pageNum} className="mb-6">
+                          {sortedPages.length > 1 && (
+                            <div className="text-[10px] text-white/30 mb-1">Page {pageNum}</div>
+                          )}
+                          <div
+                            className="relative bg-white rounded shadow-lg"
+                            style={{ width: dims.width, minHeight: dims.height }}
+                          >
+                            {items.map((item, i) => (
+                              <span
+                                key={i}
+                                className="absolute text-black whitespace-nowrap"
+                                style={{
+                                  left: item.x,
+                                  top: item.y,
+                                  fontSize: Math.max(8, item.height * 0.9),
+                                  lineHeight: 1,
+                                }}
+                              >
+                                {item.text}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )
+                    }) : (
+                      <div className="flex items-center justify-center h-full text-gray-400 text-sm">
+                        No text found
+                      </div>
+                    )
+                  })()}
                 </div>
               </div>
             )}

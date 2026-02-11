@@ -83,8 +83,8 @@ export default function ImageResizerTool() {
       if (previewRef.current) {
         const ctx = previewRef.current.getContext('2d')!
         const previewScale = Math.min(400 / width, 300 / height, 1)
-        previewRef.current.width = width * previewScale
-        previewRef.current.height = height * previewScale
+        previewRef.current.width = Math.round(width * previewScale)
+        previewRef.current.height = Math.round(height * previewScale)
         ctx.drawImage(canvas, 0, 0, previewRef.current.width, previewRef.current.height)
       }
     } catch (err) {

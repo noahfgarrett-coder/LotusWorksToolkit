@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import type { InputHTMLAttributes } from 'react'
 
 interface SliderProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 'type'> {
@@ -6,7 +7,7 @@ interface SliderProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 'type'
   suffix?: string
 }
 
-export function Slider({
+export const Slider = memo(function Slider({
   label,
   showValue = true,
   suffix = '',
@@ -43,4 +44,4 @@ export function Slider({
       />
     </div>
   )
-}
+})

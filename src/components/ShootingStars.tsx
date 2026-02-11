@@ -25,7 +25,7 @@ export function ShootingStars() {
 
     // Start near top, biased to the side they'll travel from
     const x = goLeft ? 40 + Math.random() * 55 : 5 + Math.random() * 55
-    const y = Math.random() * 10
+    const y = Math.random() * 40
 
     // Shallow angle: 5–25° below horizontal
     const tilt = 5 + Math.random() * 20

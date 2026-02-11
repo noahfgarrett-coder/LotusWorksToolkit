@@ -1,549 +1,664 @@
+/**
+ * DashboardTool — Main orchestrator for the dashboard BI tool.
+ * Wires together: store, shortcuts, auto-save, data import,
+ * dashboard canvas, widget palette, data table, and export.
+ */
+
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
-import { FileDropZone } from '@/components/common/FileDropZone.tsx'
-import { Button } from '@/components/common/Button.tsx'
-import { downloadBlob } from '@/utils/download.ts'
-import {
-  Plus, Trash2, RotateCcw, Download, GripVertical, X,
-  BarChart3, TrendingUp, Layers, Hash, Target,
-} from 'lucide-react'
-import GridLayout, { WidthProvider } from 'react-grid-layout'
-import 'react-grid-layout/css/styles.css'
-import 'react-resizable/css/styles.css'
-import {
-  ResponsiveContainer, BarChart, Bar, LineChart, Line,
-  PieChart, Pie, AreaChart, Area,
-  XAxis, YAxis, CartesianGrid, Tooltip, Cell,
-} from 'recharts'
-import * as XLSX from 'xlsx'
+import { useAppStore } from '@/stores/appStore.ts'
+import { BarChart3, Plus, Upload, FolderOpen, Trash2, Copy, FileJson, AlertTriangle, DatabaseZap, FileUp } from 'lucide-react'
+import { useDashboardStore } from './dashboardStore.ts'
+import { useFileHandle } from './useFileHandle.ts'
+import { attachShortcuts } from './shortcuts.ts'
+import { saveDashboard, loadAllDashboards, deleteDashboard as deleteFromStorage } from './storage.ts'
+import { exportDashboardPNG, exportDashboardJSON, parseDashboardJSON, exportDataCSV } from './export.ts'
+import { Toolbar } from './Toolbar.tsx'
+import { DashboardCanvas } from './DashboardCanvas.tsx'
+import { WidgetPalette } from './WidgetPalette.tsx'
+import { DataImporter } from './DataImporter.tsx'
+import { DataTable } from './DataTable.tsx'
+import { BackgroundEditor } from './BackgroundEditor.tsx'
+import type { Dashboard, Widget } from './types.ts'
 
-// ── Types ──────────────────────────────────────────────
+// ── Modal views ─────────────────────────────────
 
-type Row = Record<string, unknown>
-type ChartType = 'bar' | 'line' | 'pie' | 'area' | 'kpi'
-type AggType = 'sum' | 'avg' | 'count' | 'min' | 'max' | 'none'
+type ModalView = 'none' | 'addWidget' | 'importData' | 'viewData' | 'background'
 
-interface Widget {
-  id: string
-  type: ChartType
-  title: string
-  xColumn: string
-  yColumn: string
-  aggregation: AggType
-}
-
-interface LayoutItem {
-  i: string; x: number; y: number; w: number; h: number
-}
-
-// ── Constants ──────────────────────────────────────────
-
-const AutoGrid = WidthProvider(GridLayout)
-
-const COLORS = [
-  '#F47B20', '#0077B6', '#22c55e', '#eab308', '#ef4444',
-  '#8b5cf6', '#ec4899', '#06b6d4', '#f59e0b', '#6366f1',
-]
-
-const CHART_TYPES: { type: ChartType; icon: React.ComponentType<{ size?: number; className?: string }>; label: string }[] = [
-  { type: 'bar', icon: BarChart3, label: 'Bar' },
-  { type: 'line', icon: TrendingUp, label: 'Line' },
-  { type: 'pie', icon: Target, label: 'Pie' },
-  { type: 'area', icon: Layers, label: 'Area' },
-  { type: 'kpi', icon: Hash, label: 'KPI' },
-]
-
-const DEFAULT_SIZES: Record<ChartType, { w: number; h: number }> = {
-  bar: { w: 4, h: 4 }, line: { w: 4, h: 4 }, pie: { w: 3, h: 4 },
-  area: { w: 4, h: 4 }, kpi: { w: 2, h: 2 },
-}
-
-const TOOLTIP_STYLE = {
-  contentStyle: { background: '#1a1a24', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8, fontSize: 12, color: 'white' },
-  labelStyle: { color: 'rgba(255,255,255,0.5)' },
-}
-
-const AGG_OPTIONS: { value: AggType; label: string }[] = [
-  { value: 'sum', label: 'Sum' }, { value: 'avg', label: 'Average' },
-  { value: 'count', label: 'Count' }, { value: 'min', label: 'Min' },
-  { value: 'max', label: 'Max' }, { value: 'none', label: 'None (raw)' },
-]
-
-function genId() { return Math.random().toString(36).substring(2, 11) }
-
-// ── Data helpers ───────────────────────────────────────
-
-async function parseDataFile(file: File): Promise<{ columns: string[]; rows: Row[] }> {
-  const buffer = await file.arrayBuffer()
-  const wb = XLSX.read(new Uint8Array(buffer), { type: 'array' })
-  const ws = wb.Sheets[wb.SheetNames[0]]
-  const jsonData = XLSX.utils.sheet_to_json(ws) as Row[]
-  if (jsonData.length === 0) return { columns: [], rows: [] }
-  return { columns: Object.keys(jsonData[0]), rows: jsonData }
-}
-
-function detectNumeric(columns: string[], rows: Row[]): Set<string> {
-  const numeric = new Set<string>()
-  for (const col of columns) {
-    const sample = rows.slice(0, 50).map(r => r[col])
-    const numCount = sample.filter(v => v !== null && v !== undefined && v !== '' && !isNaN(Number(v))).length
-    if (numCount > sample.length * 0.6) numeric.add(col)
-  }
-  return numeric
-}
-
-function aggregateData(rows: Row[], xCol: string, yCol: string, agg: AggType): { name: string; value: number }[] {
-  if (agg === 'none') {
-    return rows.slice(0, 200).map(r => ({
-      name: String(r[xCol] ?? ''),
-      value: Number(r[yCol] ?? 0) || 0,
-    }))
-  }
-
-  const groups = new Map<string, number[]>()
-  for (const row of rows) {
-    const key = String(row[xCol] ?? '')
-    const val = Number(row[yCol] ?? 0)
-    if (!groups.has(key)) groups.set(key, [])
-    if (!isNaN(val)) groups.get(key)!.push(val)
-  }
-
-  return Array.from(groups.entries()).map(([name, vals]) => {
-    let value: number
-    switch (agg) {
-      case 'sum': value = vals.reduce((a, b) => a + b, 0); break
-      case 'avg': value = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0; break
-      case 'count': value = vals.length; break
-      case 'min': value = vals.length ? Math.min(...vals) : 0; break
-      case 'max': value = vals.length ? Math.max(...vals) : 0; break
-      default: value = vals[0] ?? 0
-    }
-    return { name, value: Math.round(value * 100) / 100 }
-  })
-}
-
-function calculateKPI(rows: Row[], yCol: string, agg: AggType): number {
-  const values = rows.map(r => Number(r[yCol] ?? 0)).filter(v => !isNaN(v))
-  if (values.length === 0) return 0
-  switch (agg) {
-    case 'sum': return values.reduce((a, b) => a + b, 0)
-    case 'avg': return values.reduce((a, b) => a + b, 0) / values.length
-    case 'count': return values.length
-    case 'min': return Math.min(...values)
-    case 'max': return Math.max(...values)
-    default: return values[0]
-  }
-}
-
-// ── Chart renderer ─────────────────────────────────────
-
-function ChartWidget({ widget, rows }: { widget: Widget; rows: Row[] }) {
-  const data = useMemo(() => aggregateData(rows, widget.xColumn, widget.yColumn, widget.aggregation), [rows, widget])
-
-  if (widget.type === 'kpi') {
-    const value = calculateKPI(rows, widget.yColumn, widget.aggregation)
-    return (
-      <div className="h-full flex flex-col items-center justify-center px-4">
-        <p className="text-3xl font-bold text-[#F47B20]">
-          {value.toLocaleString(undefined, { maximumFractionDigits: 2 })}
-        </p>
-        <p className="text-xs text-white/40 mt-1">{widget.aggregation} of {widget.yColumn}</p>
-      </div>
-    )
-  }
-
-  if (widget.type === 'pie') {
-    return (
-      <ResponsiveContainer width="100%" height="100%">
-        <PieChart>
-          <Pie data={data} dataKey="value" nameKey="name" cx="50%" cy="50%"
-            outerRadius="75%" innerRadius="30%" paddingAngle={2} stroke="none"
-            label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
-            labelLine={false}
-            fontSize={9} fill={COLORS[0]}
-          >
-            {data.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-          </Pie>
-          <Tooltip {...TOOLTIP_STYLE} />
-        </PieChart>
-      </ResponsiveContainer>
-    )
-  }
-
-  const axisProps = {
-    stroke: 'rgba(255,255,255,0.12)',
-    tick: { fill: 'rgba(255,255,255,0.35)', fontSize: 10 },
-    tickLine: false,
-    axisLine: false,
-  }
-
-  if (widget.type === 'bar') {
-    return (
-      <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: -10 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
-          <XAxis dataKey="name" {...axisProps} />
-          <YAxis {...axisProps} />
-          <Tooltip {...TOOLTIP_STYLE} />
-          <Bar dataKey="value" fill={COLORS[0]} radius={[4, 4, 0, 0]} />
-        </BarChart>
-      </ResponsiveContainer>
-    )
-  }
-
-  if (widget.type === 'line') {
-    return (
-      <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: -10 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
-          <XAxis dataKey="name" {...axisProps} />
-          <YAxis {...axisProps} />
-          <Tooltip {...TOOLTIP_STYLE} />
-          <Line type="monotone" dataKey="value" stroke={COLORS[0]} strokeWidth={2} dot={{ fill: COLORS[0], r: 3 }} />
-        </LineChart>
-      </ResponsiveContainer>
-    )
-  }
-
-  if (widget.type === 'area') {
-    return (
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: -10 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
-          <XAxis dataKey="name" {...axisProps} />
-          <YAxis {...axisProps} />
-          <Tooltip {...TOOLTIP_STYLE} />
-          <defs>
-            <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor={COLORS[0]} stopOpacity={0.3} />
-              <stop offset="95%" stopColor={COLORS[0]} stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <Area type="monotone" dataKey="value" stroke={COLORS[0]} strokeWidth={2} fill="url(#areaGrad)" />
-        </AreaChart>
-      </ResponsiveContainer>
-    )
-  }
-
-  return null
-}
-
-// ── Component ──────────────────────────────────────────
+// ── Component ───────────────────────────────────
 
 export default function DashboardTool() {
-  const [fileName, setFileName] = useState('')
-  const [columns, setColumns] = useState<string[]>([])
-  const [rows, setRows] = useState<Row[]>([])
-  const [numericCols, setNumericCols] = useState<Set<string>>(new Set())
-  const [widgets, setWidgets] = useState<Widget[]>([])
-  const [layout, setLayout] = useState<LayoutItem[]>([])
-  const [showAddModal, setShowAddModal] = useState(false)
-  const [isLoading, setIsLoading] = useState(false)
-  const [loadError, setLoadError] = useState<string | null>(null)
+  const store = useDashboardStore()
+  const fileHandle = useFileHandle()
+  const [modalView, setModalView] = useState<ModalView>('none')
+  const [isLoaded, setIsLoaded] = useState(false)
   const gridRef = useRef<HTMLDivElement>(null)
 
-  // New widget form state
-  const [newType, setNewType] = useState<ChartType>('bar')
-  const [newXCol, setNewXCol] = useState('')
-  const [newYCol, setNewYCol] = useState('')
-  const [newAgg, setNewAgg] = useState<AggType>('sum')
-  const [newTitle, setNewTitle] = useState('')
+  // ── Load from localStorage on mount ───────────
 
-  // Inject react-grid-layout dark theme overrides
   useEffect(() => {
-    const style = document.createElement('style')
-    style.textContent = `
-      .react-grid-placeholder { background: rgba(244,123,32,0.08) !important; border: 1px dashed rgba(244,123,32,0.3) !important; border-radius: 12px; }
-      .react-resizable-handle::after { border-right-color: rgba(255,255,255,0.15) !important; border-bottom-color: rgba(255,255,255,0.15) !important; }
-    `
-    document.head.appendChild(style)
-    return () => { document.head.removeChild(style) }
-  }, [])
+    const entries = loadAllDashboards()
+    if (entries.length > 0) {
+      const storedDashboards: [string, Dashboard][] = []
+      const storedWidgets: [string, Widget][] = []
+      let activeId: string | null = null
 
-  // ── Data import ──────────────────────────────────────
+      for (const entry of entries) {
+        storedDashboards.push([entry.dashboard.id, entry.dashboard])
+        for (const w of entry.widgets) {
+          storedWidgets.push([w.id, w])
+        }
+        if (!activeId) activeId = entry.dashboard.id
+      }
 
-  const handleFiles = useCallback(async (files: File[]) => {
-    const file = files[0]
-    if (!file) return
-    setIsLoading(true)
-    setLoadError(null)
-    try {
-      const { columns: cols, rows: r } = await parseDataFile(file)
-      setColumns(cols)
-      setRows(r)
-      setFileName(file.name)
-      setNumericCols(detectNumeric(cols, r))
-      setWidgets([])
-      setLayout([])
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Unknown error'
-      setLoadError(`Failed to parse file: ${msg}`)
-    } finally {
-      setIsLoading(false)
+      store.loadState(storedDashboards, storedWidgets, activeId)
     }
+    setIsLoaded(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // ── Widget management ────────────────────────────────
+  // ── Auto-save on dashboard/widget changes ─────
 
-  const openAddModal = useCallback(() => {
-    const categoryCols = columns.filter(c => !numericCols.has(c))
-    const numCols = columns.filter(c => numericCols.has(c))
-    setNewType('bar')
-    setNewXCol(categoryCols[0] || columns[0] || '')
-    setNewYCol(numCols[0] || columns[0] || '')
-    setNewAgg('sum')
-    setNewTitle('')
-    setShowAddModal(true)
-  }, [columns, numericCols])
+  const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
-  const handleAddWidget = useCallback(() => {
-    if (!newYCol) return
-    const id = genId()
-    const title = newTitle || `${newType.charAt(0).toUpperCase() + newType.slice(1)} — ${newYCol}`
-    const widget: Widget = { id, type: newType, title, xColumn: newXCol, yColumn: newYCol, aggregation: newAgg }
-    setWidgets(prev => [...prev, widget])
+  useEffect(() => {
+    if (!isLoaded) return
+    if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current)
 
-    const size = DEFAULT_SIZES[newType]
-    setLayout(prev => [...prev, { i: id, x: (prev.length * 4) % 12, y: Infinity, w: size.w, h: size.h }])
-    setShowAddModal(false)
-  }, [newType, newXCol, newYCol, newAgg, newTitle])
+    saveTimeoutRef.current = setTimeout(() => {
+      for (const [, dashboard] of store.dashboards) {
+        const widgets = store.getDashboardWidgets(dashboard.id)
+        saveDashboard(dashboard, widgets)
+      }
+    }, 1000)
 
-  const removeWidget = useCallback((id: string) => {
-    setWidgets(prev => prev.filter(w => w.id !== id))
-    setLayout(prev => prev.filter(l => l.i !== id))
-  }, [])
+    return () => {
+      if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current)
+    }
+  }, [store.dashboards, store.widgets, store.getDashboardWidgets, isLoaded])
 
-  const handleLayoutChange = useCallback((newLayout: LayoutItem[]) => {
-    setLayout(newLayout)
-  }, [])
-
-  // ── Export ───────────────────────────────────────────
+  // ── Keyboard shortcuts ────────────────────────
 
   const handleExportPNG = useCallback(async () => {
     if (!gridRef.current) return
     try {
-      const html2canvas = (await import('html2canvas')).default
-      const canvas = await html2canvas(gridRef.current, {
-        backgroundColor: '#0a0a14',
-        scale: 2,
-      })
-      canvas.toBlob(blob => { if (blob) downloadBlob(blob, 'dashboard.png') })
+      await exportDashboardPNG(gridRef.current)
     } catch {
-      // Fallback: simple canvas approach
-      const el = gridRef.current!
-      const canvas = document.createElement('canvas')
-      canvas.width = el.scrollWidth * 2
-      canvas.height = el.scrollHeight * 2
-      const ctx = canvas.getContext('2d')!
-      ctx.scale(2, 2)
-      ctx.fillStyle = '#0a0a14'
-      ctx.fillRect(0, 0, el.scrollWidth, el.scrollHeight)
-      ctx.fillStyle = '#ffffff'
-      ctx.font = '16px sans-serif'
-      ctx.textAlign = 'center'
-      ctx.fillText('Use browser screenshot to export', el.scrollWidth / 2, el.scrollHeight / 2)
-      canvas.toBlob(blob => { if (blob) downloadBlob(blob, 'dashboard.png') })
+      useAppStore.getState().addToast({ type: 'error', message: 'PNG export failed' })
     }
   }, [])
 
-  // ── Reset ────────────────────────────────────────────
+  const handleSave = useCallback(() => {
+    for (const [, dashboard] of store.dashboards) {
+      const widgets = store.getDashboardWidgets(dashboard.id)
+      saveDashboard(dashboard, widgets)
+    }
+  }, [store.dashboards, store.getDashboardWidgets])
 
-  const handleReset = useCallback(() => {
-    setColumns([])
-    setRows([])
-    setFileName('')
-    setWidgets([])
-    setLayout([])
-    setNumericCols(new Set())
-  }, [])
+  useEffect(() => {
+    return attachShortcuts(store, {
+      onExport: handleExportPNG,
+      onSave: handleSave,
+      onAddWidget: () => setModalView('addWidget'),
+    })
+  }, [store, handleExportPNG, handleSave])
 
-  // ── Render ───────────────────────────────────────────
+  // ── Callbacks ─────────────────────────────────
 
-  if (columns.length === 0) {
+  const handleExportJSON = useCallback(() => {
+    if (!store.activeDashboardId) return
+    const dashboard = store.dashboards.get(store.activeDashboardId)
+    if (!dashboard) return
+    const widgets = store.getDashboardWidgets(dashboard.id)
+    exportDashboardJSON(dashboard, widgets, store.dataSources)
+  }, [store.activeDashboardId, store.dashboards, store.getDashboardWidgets, store.dataSources])
+
+  const handleImportJSON = useCallback(() => {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = '.json'
+    input.onchange = async () => {
+      const file = input.files?.[0]
+      if (!file) return
+      try {
+        const text = await file.text()
+        parseDashboardJSON(text) // validate
+        store.importDashboard(text)
+      } catch {
+        useAppStore.getState().addToast({ type: 'error', message: 'Invalid dashboard JSON file' })
+      }
+    }
+    input.click()
+  }, [store])
+
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+
+  const handleDeleteDashboard = useCallback(() => {
+    if (!store.activeDashboardId) return
+    setConfirmDelete(store.activeDashboardId)
+  }, [store.activeDashboardId])
+
+  const confirmDeleteDashboard = useCallback((id: string) => {
+    store.deleteDashboard(id)
+    deleteFromStorage(id)
+    setConfirmDelete(null)
+  }, [store])
+
+  const handleDataImportSuccess = useCallback((dataSourceId: string) => {
+    setModalView('none')
+    store.setActiveDataSource(dataSourceId)
+
+    // If no dashboard exists, create one
+    if (store.dashboards.size === 0) {
+      store.createDashboard('Dashboard 1')
+      store.setIsEditMode(true)
+    }
+  }, [store])
+
+  const handleExportCSV = useCallback(() => {
+    if (!store.activeDataSourceId) return
+    const ds = store.getDataSource(store.activeDataSourceId)
+    if (!ds) return
+    exportDataCSV(ds.columns, ds.rows, `${ds.name}.csv`)
+  }, [store])
+
+  // ── Dashboard list view (no active dashboard) ─
+
+  if (isLoaded && !store.activeDashboardId) {
+    const dashboardList = Array.from(store.dashboards.values())
+    const hasData = store.dataSources.size > 0
+
     return (
-      <div className="h-full flex flex-col gap-4">
-        <FileDropZone
-          onFiles={handleFiles}
-          accept=".csv,.xlsx,.xls,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-          multiple={false}
-          label="Drop a CSV or Excel file"
-          description="Import data to create charts and dashboards"
-          className="h-full"
-        />
-        {isLoading && (
-          <div className="text-center text-sm text-white/40">Loading data...</div>
-        )}
-        {loadError && (
-          <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
-            <p className="text-sm text-red-400 flex-1">{loadError}</p>
-            <button onClick={() => setLoadError(null)} className="p-1 rounded text-red-400/60 hover:text-red-400 transition-colors" aria-label="Dismiss error">
-              <X size={14} />
+      <div className="h-full flex flex-col">
+        {/* Header */}
+        <div className="flex items-center justify-between px-1 pb-4 flex-shrink-0">
+          <div className="flex items-center gap-2">
+            <BarChart3 size={18} className="text-[#F47B20]" />
+            <h2 className="text-sm font-semibold text-dark-text-primary">Dashboards</h2>
+          </div>
+          <div className="flex items-center gap-2">
+            {!hasData && (
+              <button
+                onClick={() => setModalView('importData')}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg
+                  bg-white/[0.06] hover:bg-white/[0.1] text-dark-text-muted transition-colors"
+              >
+                <Upload size={14} />
+                Import Data
+              </button>
+            )}
+            <button
+              onClick={handleImportJSON}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg
+                bg-white/[0.06] hover:bg-white/[0.1] text-dark-text-muted transition-colors"
+            >
+              <FileJson size={14} />
+              Import JSON
+            </button>
+            <button
+              onClick={() => {
+                const id = store.createDashboard(`Dashboard ${dashboardList.length + 1}`)
+                store.setActiveDashboard(id)
+                store.setIsEditMode(true)
+                if (!hasData) setModalView('importData')
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg
+                bg-[#F47B20] hover:bg-[#F47B20]/90 text-white transition-colors"
+            >
+              <Plus size={14} />
+              New Dashboard
             </button>
           </div>
+        </div>
+
+        {/* Dashboard cards or empty state */}
+        {dashboardList.length === 0 ? (
+          <div className="flex-1 flex flex-col items-center justify-center text-center gap-4">
+            <div className="w-16 h-16 rounded-2xl bg-white/[0.04] flex items-center justify-center">
+              <BarChart3 size={28} className="text-white/20" />
+            </div>
+            <div>
+              <p className="text-sm font-medium text-dark-text-primary">No dashboards yet</p>
+              <p className="text-xs text-dark-text-muted mt-1">
+                {hasData
+                  ? 'Create a dashboard to start visualizing your data'
+                  : 'Import data and create your first dashboard'}
+              </p>
+            </div>
+            <button
+              onClick={() => {
+                const id = store.createDashboard('Dashboard 1')
+                store.setActiveDashboard(id)
+                store.setIsEditMode(true)
+                if (!hasData) setModalView('importData')
+              }}
+              className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-lg
+                bg-[#F47B20] hover:bg-[#F47B20]/90 text-white transition-colors"
+            >
+              <Plus size={14} />
+              Create Dashboard
+            </button>
+          </div>
+        ) : (
+          <div className="flex-1 overflow-auto">
+            <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+              {dashboardList.map((d) => {
+                const widgetCount = d.widgetIds.length
+                return (
+                  <button
+                    key={d.id}
+                    onClick={() => store.setActiveDashboard(d.id)}
+                    className="text-left p-4 rounded-xl border border-dark-border bg-white/[0.02]
+                      hover:bg-white/[0.05] hover:border-white/[0.12] transition-all group"
+                  >
+                    <div className="flex items-start justify-between mb-3">
+                      <div className="w-8 h-8 rounded-lg bg-[#F47B20]/10 flex items-center justify-center">
+                        <BarChart3 size={16} className="text-[#F47B20]" />
+                      </div>
+                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            store.duplicateDashboard(d.id)
+                          }}
+                          className="p-1 rounded hover:bg-white/[0.1] text-dark-text-muted"
+                          title="Duplicate"
+                        >
+                          <Copy size={12} />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setConfirmDelete(d.id)
+                          }}
+                          className="p-1 rounded hover:bg-red-500/20 text-dark-text-muted hover:text-red-400"
+                          title="Delete"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    </div>
+                    <p className="text-sm font-medium text-dark-text-primary truncate">{d.name}</p>
+                    <p className="text-xs text-dark-text-muted mt-1">
+                      {widgetCount} widget{widgetCount !== 1 ? 's' : ''}
+                    </p>
+                    <p className="text-[10px] text-dark-text-muted/60 mt-1">
+                      Updated {new Date(d.updatedAt).toLocaleDateString()}
+                    </p>
+                  </button>
+                )
+              })}
+
+              {/* New dashboard card */}
+              <button
+                onClick={() => {
+                  const id = store.createDashboard(`Dashboard ${dashboardList.length + 1}`)
+                  store.setActiveDashboard(id)
+                  store.setIsEditMode(true)
+                  if (!hasData) setModalView('importData')
+                }}
+                className="flex flex-col items-center justify-center p-4 rounded-xl
+                  border-2 border-dashed border-dark-border hover:border-[#F47B20]/40
+                  text-dark-text-muted hover:text-[#F47B20] transition-all min-h-[120px]"
+              >
+                <Plus size={20} className="mb-1" />
+                <span className="text-xs">New Dashboard</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Data import modal */}
+        {modalView === 'importData' && (
+          <ModalOverlay onClose={() => setModalView('none')}>
+            <DataImporter
+              store={store}
+              fileHandle={fileHandle}
+              onSuccess={handleDataImportSuccess}
+              onCancel={() => setModalView('none')}
+            />
+          </ModalOverlay>
+        )}
+
+        {/* Delete confirmation */}
+        {confirmDelete && (
+          <ConfirmDeleteDialog
+            name={store.dashboards.get(confirmDelete)?.name ?? 'this dashboard'}
+            onConfirm={() => confirmDeleteDashboard(confirmDelete)}
+            onCancel={() => setConfirmDelete(null)}
+          />
         )}
       </div>
     )
   }
 
+  // ── Active dashboard view ─────────────────────
+
+  const activeDs = store.activeDataSourceId
+    ? store.getDataSource(store.activeDataSourceId)
+    : undefined
+
+  // Detect widgets referencing data sources that aren't loaded
+  const missingDataSourceIds = useMemo(() => {
+    if (!store.activeDashboardId) return new Set<string>()
+    const widgets = store.getDashboardWidgets(store.activeDashboardId)
+    const missing = new Set<string>()
+    for (const w of widgets) {
+      if (w.dataSourceId && !store.dataSources.has(w.dataSourceId)) {
+        missing.add(w.dataSourceId)
+      }
+    }
+    return missing
+  }, [store.activeDashboardId, store.getDashboardWidgets, store.dataSources])
+
+  const hasNoData = store.dataSources.size === 0
+  const hasMissingData = missingDataSourceIds.size > 0
+
+  // Try auto-reconnect via stored file handles
+  const [isReconnecting, setIsReconnecting] = useState(false)
+  const [reconnectFailed, setReconnectFailed] = useState(false)
+
+  const handleReconnect = useCallback(async () => {
+    setIsReconnecting(true)
+    setReconnectFailed(false)
+
+    let anyReconnected = false
+    for (const dsId of missingDataSourceIds) {
+      try {
+        const file = await fileHandle.requestPermission(dsId)
+        if (file) {
+          const { parseFile } = await import('./xlsxParser.ts')
+          const dataSource = await parseFile(file)
+          // Re-add with same ID so widget references reconnect
+          store.addDataSource({ ...dataSource, id: dsId })
+          store.setActiveDataSource(dsId)
+          anyReconnected = true
+        }
+      } catch {
+        // individual reconnect failed — continue trying others
+      }
+    }
+
+    setIsReconnecting(false)
+    if (!anyReconnected) setReconnectFailed(true)
+  }, [missingDataSourceIds, fileHandle, store])
+
+  // Check if we have stored handles for the missing sources
+  const hasStoredHandles = fileHandle.storedHandles.some(
+    (h) => missingDataSourceIds.has(h.id),
+  )
+
   return (
     <div className="h-full flex flex-col">
-      {/* ── Toolbar ─────────────────────────────── */}
-      <div className="flex items-center gap-3 px-1 pb-3 flex-shrink-0">
-        <div className="flex items-center gap-2">
-          <div className="w-2 h-2 rounded-full bg-green-400" />
-          <span className="text-xs text-white/60 truncate max-w-[200px]">{fileName}</span>
-          <span className="text-[10px] text-white/25">{rows.length.toLocaleString()} rows · {columns.length} cols</span>
-        </div>
-        <div className="flex-1" />
-        <Button size="sm" onClick={openAddModal} icon={<Plus size={12} />}>
-          Add Widget
-        </Button>
-        <Button variant="ghost" size="sm" onClick={handleReset} icon={<RotateCcw size={12} />}>
-          New Data
-        </Button>
-      </div>
+      {/* Toolbar */}
+      <Toolbar
+        store={store}
+        onAddWidget={() => setModalView('addWidget')}
+        onViewData={() => setModalView('viewData')}
+        onImportData={() => setModalView('importData')}
+        onBackground={() => setModalView('background')}
+        onExportPNG={handleExportPNG}
+        onExportJSON={handleExportJSON}
+        onImportJSON={handleImportJSON}
+        onSave={handleSave}
+        onDelete={handleDeleteDashboard}
+        onNewDashboard={() => {
+          const id = store.createDashboard(`Dashboard ${store.dashboards.size + 1}`)
+          store.setActiveDashboard(id)
+          store.setIsEditMode(true)
+          if (store.dataSources.size === 0) setModalView('importData')
+        }}
+        onGoToList={() => store.setActiveDashboard(null)}
+      />
 
-      {/* ── Dashboard Grid ──────────────────────── */}
-      <div ref={gridRef} className="flex-1 overflow-auto">
-        {widgets.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center text-white/20 gap-3">
-            <BarChart3 size={32} />
-            <p className="text-sm">No widgets yet</p>
-            <Button size="sm" onClick={openAddModal} icon={<Plus size={12} />}>
-              Add Your First Widget
-            </Button>
-          </div>
-        ) : (
-          <AutoGrid
-            layout={layout}
-            cols={12}
-            rowHeight={80}
-            onLayoutChange={handleLayoutChange}
-            draggableHandle=".drag-handle"
-            margin={[12, 12]}
-            compactType="vertical"
-            useCSSTransforms
-          >
-            {widgets.map(w => (
-              <div key={w.id} className="rounded-xl border border-white/[0.06] bg-white/[0.03] overflow-hidden flex flex-col">
-                {/* Widget header */}
-                <div className="flex items-center gap-1.5 px-3 py-2 flex-shrink-0 border-b border-white/[0.04]">
-                  <div className="drag-handle cursor-grab active:cursor-grabbing p-0.5 text-white/20 hover:text-white/40">
-                    <GripVertical size={12} />
-                  </div>
-                  <span className="text-[11px] text-white/70 font-medium flex-1 truncate">{w.title}</span>
-                  <button onClick={() => removeWidget(w.id)} className="p-0.5 text-white/15 hover:text-red-400 transition-colors" aria-label={`Delete ${w.title}`}>
-                    <Trash2 size={11} />
-                  </button>
-                </div>
-                {/* Chart content */}
-                <div className="flex-1 p-2 min-h-0">
-                  <ChartWidget widget={w} rows={rows} />
-                </div>
-              </div>
-            ))}
-          </AutoGrid>
+      {/* Data source needed banner */}
+      {(hasNoData || hasMissingData) && store.activeDashboardId && (
+        <DataSourceBanner
+          hasStoredHandles={hasStoredHandles}
+          isReconnecting={isReconnecting}
+          reconnectFailed={reconnectFailed}
+          onReconnect={handleReconnect}
+          onImportData={() => setModalView('importData')}
+        />
+      )}
+
+      {/* Dashboard Canvas */}
+      <div ref={gridRef} className="flex-1 overflow-auto min-h-0">
+        {store.activeDashboardId && (
+          <DashboardCanvas store={store} dashboardId={store.activeDashboardId} />
         )}
       </div>
 
-      {/* ── Add Widget Modal ────────────────────── */}
-      {showAddModal && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setShowAddModal(false)}>
-          <div className="bg-[#12121a] border border-white/[0.1] rounded-xl p-5 w-[380px] space-y-4 shadow-2xl" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-medium text-white">Add Widget</h3>
-              <button onClick={() => setShowAddModal(false)} className="p-1 text-white/30 hover:text-white" aria-label="Close modal">
-                <X size={14} />
-              </button>
-            </div>
+      {/* Modals */}
+      {modalView === 'addWidget' && store.activeDashboardId && (
+        <ModalOverlay onClose={() => setModalView('none')}>
+          <WidgetPalette
+            dashboardId={store.activeDashboardId}
+            store={store}
+            onClose={() => setModalView('none')}
+          />
+        </ModalOverlay>
+      )}
 
-            {/* Chart type */}
-            <div className="space-y-1.5">
-              <span className="text-[10px] text-white/50 uppercase tracking-wider">Type</span>
-              <div className="grid grid-cols-5 gap-1.5">
-                {CHART_TYPES.map(t => (
-                  <button
-                    key={t.type}
-                    onClick={() => setNewType(t.type)}
-                    className={`p-2 rounded-lg text-center transition-colors ${
-                      newType === t.type ? 'bg-[#F47B20] text-white' : 'bg-white/[0.05] text-white/40 hover:text-white'
-                    }`}
-                  >
-                    <t.icon size={16} className="mx-auto mb-0.5" />
-                    <span className="text-[9px]">{t.label}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
+      {modalView === 'importData' && (
+        <ModalOverlay onClose={() => setModalView('none')}>
+          <DataImporter
+            store={store}
+            fileHandle={fileHandle}
+            onSuccess={handleDataImportSuccess}
+            onCancel={() => setModalView('none')}
+          />
+        </ModalOverlay>
+      )}
 
-            {/* X Column (not for KPI) */}
-            {newType !== 'kpi' && (
-              <div className="space-y-1.5">
-                <span className="text-[10px] text-white/50 uppercase tracking-wider">
-                  {newType === 'pie' ? 'Category Column' : 'X Axis'}
+      {modalView === 'background' && store.activeDashboardId && (
+        <ModalOverlay onClose={() => setModalView('none')}>
+          <BackgroundEditor
+            current={store.activeDashboard?.background}
+            onApply={(bg) => {
+              if (store.activeDashboardId) {
+                store.setDashboardBackground(store.activeDashboardId, bg)
+              }
+              setModalView('none')
+            }}
+            onClose={() => setModalView('none')}
+          />
+        </ModalOverlay>
+      )}
+
+      {modalView === 'viewData' && activeDs && (
+        <ModalOverlay onClose={() => setModalView('none')} wide>
+          <div className="h-[80vh] flex flex-col">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-dark-border">
+              <div className="flex items-center gap-2">
+                <FolderOpen size={16} className="text-[#F47B20]" />
+                <span className="text-sm font-medium text-dark-text-primary">{activeDs.name}</span>
+                <span className="text-xs text-dark-text-muted">
+                  {activeDs.rowCount.toLocaleString()} rows &middot; {activeDs.columns.length} columns
                 </span>
-                <select
-                  value={newXCol}
-                  onChange={e => setNewXCol(e.target.value)}
-                  className="w-full px-3 py-2 text-sm bg-dark-surface border border-white/[0.1] rounded-lg text-white"
-                >
-                  {columns.map(c => (
-                    <option key={c} value={c}>{c} {numericCols.has(c) ? '(#)' : '(A)'}</option>
-                  ))}
-                </select>
               </div>
-            )}
-
-            {/* Y Column */}
-            <div className="space-y-1.5">
-              <span className="text-[10px] text-white/50 uppercase tracking-wider">
-                {newType === 'kpi' ? 'Metric Column' : newType === 'pie' ? 'Value Column' : 'Y Axis'}
-              </span>
-              <select
-                value={newYCol}
-                onChange={e => setNewYCol(e.target.value)}
-                className="w-full px-3 py-2 text-sm bg-dark-surface border border-white/[0.1] rounded-lg text-white"
-              >
-                {columns.filter(c => numericCols.has(c)).map(c => (
-                  <option key={c} value={c}>{c}</option>
-                ))}
-                {columns.filter(c => !numericCols.has(c)).length === columns.length && (
-                  columns.map(c => <option key={c} value={c}>{c}</option>)
-                )}
-              </select>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleExportCSV}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-white/[0.06] hover:bg-white/[0.1]
+                    text-dark-text-muted transition-colors"
+                >
+                  Export CSV
+                </button>
+                <button
+                  onClick={() => setModalView('none')}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-white/[0.06] hover:bg-white/[0.1]
+                    text-dark-text-muted transition-colors"
+                >
+                  Close
+                </button>
+              </div>
             </div>
+            <DataTable
+              columns={activeDs.columns}
+              rows={activeDs.rows}
+              name={activeDs.name}
+            />
+          </div>
+        </ModalOverlay>
+      )}
 
-            {/* Aggregation */}
-            <div className="space-y-1.5">
-              <span className="text-[10px] text-white/50 uppercase tracking-wider">Aggregation</span>
-              <select
-                value={newAgg}
-                onChange={e => setNewAgg(e.target.value as AggType)}
-                className="w-full px-3 py-2 text-sm bg-dark-surface border border-white/[0.1] rounded-lg text-white"
-              >
-                {AGG_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
-            </div>
+      {/* Delete confirmation */}
+      {confirmDelete && (
+        <ConfirmDeleteDialog
+          name={store.dashboards.get(confirmDelete)?.name ?? 'this dashboard'}
+          onConfirm={() => confirmDeleteDashboard(confirmDelete)}
+          onCancel={() => setConfirmDelete(null)}
+        />
+      )}
 
-            {/* Title */}
-            <div className="space-y-1.5">
-              <span className="text-[10px] text-white/50 uppercase tracking-wider">Title (optional)</span>
-              <input
-                type="text"
-                value={newTitle}
-                onChange={e => setNewTitle(e.target.value)}
-                placeholder="Auto-generated if empty"
-                className="w-full px-3 py-2 text-sm bg-dark-surface border border-white/[0.1] rounded-lg text-white placeholder:text-white/20 focus:outline-none focus:border-[#F47B20]/40"
-              />
-            </div>
-
-            {/* Actions */}
-            <div className="flex gap-2 pt-1">
-              <Button onClick={handleAddWidget} className="flex-1">Add Widget</Button>
-              <Button variant="ghost" onClick={() => setShowAddModal(false)}>Cancel</Button>
-            </div>
+      {/* Loading overlay */}
+      {!isLoaded && (
+        <div className="absolute inset-0 bg-dark-base/80 flex items-center justify-center z-50">
+          <div className="flex items-center gap-3">
+            <div className="w-5 h-5 border-2 border-[#F47B20] border-t-transparent rounded-full animate-spin" />
+            <span className="text-sm text-dark-text-muted">Loading...</span>
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+// ── Confirm Delete Dialog ────────────────────────
+
+function ConfirmDeleteDialog({
+  name,
+  onConfirm,
+  onCancel,
+}: {
+  name: string
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  return (
+    <div
+      className="fixed inset-0 bg-black/60 flex items-center justify-center z-[60]"
+      onClick={onCancel}
+    >
+      <div
+        className="bg-[#12121a] border border-white/[0.1] rounded-xl shadow-2xl w-[380px] max-w-[90vw] p-6"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-10 h-10 rounded-full bg-red-500/10 flex items-center justify-center flex-shrink-0">
+            <AlertTriangle size={20} className="text-red-400" />
+          </div>
+          <div>
+            <h3 className="text-sm font-semibold text-dark-text-primary">Delete Dashboard</h3>
+            <p className="text-xs text-dark-text-muted mt-0.5">This action cannot be undone</p>
+          </div>
+        </div>
+        <p className="text-sm text-dark-text-secondary mb-6">
+          Are you sure you want to delete <strong className="text-dark-text-primary">{name}</strong> and all its widgets?
+        </p>
+        <div className="flex items-center justify-end gap-3">
+          <button
+            onClick={onCancel}
+            className="px-4 py-2 text-sm text-dark-text-muted hover:text-dark-text-primary transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className="px-4 py-2 text-sm font-medium bg-red-500 hover:bg-red-600 text-white rounded-lg transition-colors"
+          >
+            Delete Dashboard
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Data Source Banner ───────────────────────────
+
+function DataSourceBanner({
+  hasStoredHandles,
+  isReconnecting,
+  reconnectFailed,
+  onReconnect,
+  onImportData,
+}: {
+  hasStoredHandles: boolean
+  isReconnecting: boolean
+  reconnectFailed: boolean
+  onReconnect: () => void
+  onImportData: () => void
+}) {
+  return (
+    <div className="flex items-center gap-3 px-4 py-2.5 bg-amber-500/[0.08] border-b border-amber-500/20 flex-shrink-0">
+      <DatabaseZap size={16} className="text-amber-400 flex-shrink-0" />
+      <div className="flex-1 min-w-0">
+        <p className="text-xs text-amber-300/90">
+          {reconnectFailed
+            ? 'Auto-reconnect failed. Please re-import your data file.'
+            : 'This dashboard needs data to display its widgets.'}
+        </p>
+      </div>
+      <div className="flex items-center gap-2 flex-shrink-0">
+        {hasStoredHandles && !reconnectFailed && (
+          <button
+            onClick={onReconnect}
+            disabled={isReconnecting}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg
+              bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 transition-colors
+              disabled:opacity-50"
+          >
+            {isReconnecting ? (
+              <>
+                <div className="w-3 h-3 border-[1.5px] border-amber-300 border-t-transparent rounded-full animate-spin" />
+                Reconnecting...
+              </>
+            ) : (
+              <>
+                <DatabaseZap size={12} />
+                Reconnect Data
+              </>
+            )}
+          </button>
+        )}
+        <button
+          onClick={onImportData}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg
+            bg-[#F47B20]/20 hover:bg-[#F47B20]/30 text-[#F47B20] transition-colors"
+        >
+          <FileUp size={12} />
+          Import Data
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// ── Modal Overlay ───────────────────────────────
+
+function ModalOverlay({
+  children,
+  onClose,
+  wide = false,
+}: {
+  children: React.ReactNode
+  onClose: () => void
+  wide?: boolean
+}) {
+  return (
+    <div
+      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
+      onClick={onClose}
+    >
+      <div
+        className={`bg-[#12121a] border border-white/[0.1] rounded-xl shadow-2xl overflow-hidden ${
+          wide ? 'w-[90vw] max-w-[1200px]' : 'w-[500px] max-w-[90vw]'
+        }`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {children}
+      </div>
     </div>
   )
 }
