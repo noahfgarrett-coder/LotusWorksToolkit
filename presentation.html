@@ -287,6 +287,8 @@
 
   .stat {
     text-align: center;
+    flex: 1 1 0;
+    max-width: 280px;
   }
   .stat-value {
     font-size: clamp(2.5rem, 5vw, 4rem);
@@ -294,13 +296,14 @@
     color: var(--orange);
     line-height: 1;
     position: relative;
+    white-space: nowrap;
   }
   .stat-value .counter { display: inline-block; }
   .stat-label {
     font-size: 0.9rem;
     color: var(--text-secondary);
-    margin-top: 8px;
-    max-width: 180px;
+    margin: 8px auto 0;
+    max-width: 220px;
   }
 
   /* ── Scrolling Tool Bands ── */
@@ -558,7 +561,7 @@
   </h1>
 
   <p class="hero-description reveal reveal-delay-2">
-    16 essential engineering tools in one lightweight file.<br>
+    15 essential engineering tools in one lightweight file.<br>
     No subscriptions. No sign-ups. No limits.
   </p>
 
@@ -607,15 +610,15 @@
 
   <div class="stats-row">
     <div class="stat reveal reveal-delay-2">
-      <div class="stat-value"><span class="counter" data-target="20">0</span>+</div>
+      <div class="stat-value"><span class="counter" data-target="15">0</span>+</div>
       <div class="stat-label">minutes wasted per task on inefficient online tools</div>
     </div>
     <div class="stat reveal reveal-delay-3">
-      <div class="stat-value"><span class="counter" data-target="10">0</span>+</div>
+      <div class="stat-value"><span class="counter" data-target="5">0</span>+</div>
       <div class="stat-label">hours lost per engineer every single month</div>
     </div>
     <div class="stat reveal reveal-delay-4">
-      <div class="stat-value">$<span class="counter" data-target="6">0</span>K</div>
+      <div class="stat-value">$<span class="counter" data-target="3000">0</span>+</div>
       <div class="stat-label">annual cost per engineer in lost productivity</div>
     </div>
   </div>
@@ -631,7 +634,7 @@
 <section>
   <h2 class="section-title reveal">One File. Every Tool You Need.</h2>
   <p class="section-subtitle reveal reveal-delay-1">
-    The LotusWorks Toolkit puts 16 professional-grade tools in a single HTML file that runs entirely in your browser &mdash; and more tools are on the way. New capabilities can be added at any time without changing how you access the Toolkit.
+    The LotusWorks Toolkit puts 15 professional-grade tools in a single HTML file that runs entirely in your browser &mdash; and more tools are on the way. New capabilities can be added at any time without changing how you access the Toolkit.
   </p>
 
   <div class="tool-bands reveal reveal-delay-2">
@@ -639,42 +642,40 @@
     <div class="tool-band tool-band-left">
       <div class="tool-card"><div class="tool-icon">&#128203;</div><h3>PDF Merge</h3><p>Combine multiple PDFs with drag-and-drop reordering</p></div>
       <div class="tool-card"><div class="tool-icon">&#9986;</div><h3>PDF Split</h3><p>Extract specific pages into new documents</p></div>
-      <div class="tool-card"><div class="tool-icon">&#9997;</div><h3>PDF Annotate</h3><p>Draw, highlight, and mark up any PDF</p></div>
+      <div class="tool-card"><div class="tool-icon">&#9997;</div><h3>PDF Annotate</h3><p>Draw, highlight, measure, and mark up any PDF</p></div>
       <div class="tool-card"><div class="tool-icon">&#128167;</div><h3>PDF Watermark</h3><p>Add text or image watermarks to documents</p></div>
-      <div class="tool-card"><div class="tool-icon">&#128196;</div><h3>Text Extract</h3><p>Pull embedded text from PDFs instantly</p></div>
-      <div class="tool-card"><div class="tool-icon">&#128065;</div><h3>OCR Extract</h3><p>Read text from scanned documents and images</p></div>
+      <div class="tool-card"><div class="tool-icon">&#128196;</div><h3>Text Extract</h3><p>Pull text and tables from PDFs &mdash; embedded or OCR</p></div>
       <div class="tool-card"><div class="tool-icon">&#128208;</div><h3>Image Resizer</h3><p>Resize with aspect lock and quality control</p></div>
       <div class="tool-card"><div class="tool-icon">&#128444;</div><h3>Background Remover</h3><p>Remove backgrounds with precision eyedropper</p></div>
+      <div class="tool-card"><div class="tool-icon">&#128230;</div><h3>File Compressor</h3><p>Shrink images, strip PDF metadata, bundle as ZIP</p></div>
       <!-- duplicate for seamless loop -->
       <div class="tool-card"><div class="tool-icon">&#128203;</div><h3>PDF Merge</h3><p>Combine multiple PDFs with drag-and-drop reordering</p></div>
       <div class="tool-card"><div class="tool-icon">&#9986;</div><h3>PDF Split</h3><p>Extract specific pages into new documents</p></div>
-      <div class="tool-card"><div class="tool-icon">&#9997;</div><h3>PDF Annotate</h3><p>Draw, highlight, and mark up any PDF</p></div>
+      <div class="tool-card"><div class="tool-icon">&#9997;</div><h3>PDF Annotate</h3><p>Draw, highlight, measure, and mark up any PDF</p></div>
       <div class="tool-card"><div class="tool-icon">&#128167;</div><h3>PDF Watermark</h3><p>Add text or image watermarks to documents</p></div>
-      <div class="tool-card"><div class="tool-icon">&#128196;</div><h3>Text Extract</h3><p>Pull embedded text from PDFs instantly</p></div>
-      <div class="tool-card"><div class="tool-icon">&#128065;</div><h3>OCR Extract</h3><p>Read text from scanned documents and images</p></div>
+      <div class="tool-card"><div class="tool-icon">&#128196;</div><h3>Text Extract</h3><p>Pull text and tables from PDFs &mdash; embedded or OCR</p></div>
       <div class="tool-card"><div class="tool-icon">&#128208;</div><h3>Image Resizer</h3><p>Resize with aspect lock and quality control</p></div>
       <div class="tool-card"><div class="tool-icon">&#128444;</div><h3>Background Remover</h3><p>Remove backgrounds with precision eyedropper</p></div>
+      <div class="tool-card"><div class="tool-icon">&#128230;</div><h3>File Compressor</h3><p>Shrink images, strip PDF metadata, bundle as ZIP</p></div>
     </div>
 
-    <!-- Band 2: scrolling right — 8 tools (duplicated for seamless loop) -->
+    <!-- Band 2: scrolling right — 7 tools (duplicated for seamless loop) -->
     <div class="tool-band tool-band-right">
-      <div class="tool-card"><div class="tool-icon">&#128230;</div><h3>File Compressor</h3><p>Shrink images, strip PDF metadata, bundle as ZIP</p></div>
       <div class="tool-card"><div class="tool-icon">&#128260;</div><h3>File Converter</h3><p>Convert between image, PDF, CSV, and Excel formats</p></div>
       <div class="tool-card"><div class="tool-icon">&#128221;</div><h3>Form Builder</h3><p>Build fillable PDF forms with templates</p></div>
       <div class="tool-card"><div class="tool-icon">&#127795;</div><h3>Org Chart</h3><p>Auto-layout organizational charts from data</p></div>
-      <div class="tool-card"><div class="tool-icon">&#128202;</div><h3>Dashboard</h3><p>Build data dashboards with 10 widget types</p></div>
+      <div class="tool-card"><div class="tool-icon">&#128202;</div><h3>Dashboard</h3><p>Build data dashboards with 10+ widget types</p></div>
       <div class="tool-card"><div class="tool-icon">&#128256;</div><h3>Flowchart</h3><p>Create flowcharts from simple text commands</p></div>
       <div class="tool-card"><div class="tool-icon">&#9641;</div><h3>QR Code Generator</h3><p>Generate QR codes as PNG or SVG</p></div>
-      <div class="tool-card"><div class="tool-icon">&#128200;</div><h3>JSON/CSV Viewer</h3><p>Sortable, filterable data table from any file</p></div>
+      <div class="tool-card"><div class="tool-icon">&#128200;</div><h3>Data Viewer</h3><p>Sortable, filterable data table from JSON or CSV</p></div>
       <!-- duplicate for seamless loop -->
-      <div class="tool-card"><div class="tool-icon">&#128230;</div><h3>File Compressor</h3><p>Shrink images, strip PDF metadata, bundle as ZIP</p></div>
       <div class="tool-card"><div class="tool-icon">&#128260;</div><h3>File Converter</h3><p>Convert between image, PDF, CSV, and Excel formats</p></div>
       <div class="tool-card"><div class="tool-icon">&#128221;</div><h3>Form Builder</h3><p>Build fillable PDF forms with templates</p></div>
       <div class="tool-card"><div class="tool-icon">&#127795;</div><h3>Org Chart</h3><p>Auto-layout organizational charts from data</p></div>
-      <div class="tool-card"><div class="tool-icon">&#128202;</div><h3>Dashboard</h3><p>Build data dashboards with 10 widget types</p></div>
+      <div class="tool-card"><div class="tool-icon">&#128202;</div><h3>Dashboard</h3><p>Build data dashboards with 10+ widget types</p></div>
       <div class="tool-card"><div class="tool-icon">&#128256;</div><h3>Flowchart</h3><p>Create flowcharts from simple text commands</p></div>
       <div class="tool-card"><div class="tool-icon">&#9641;</div><h3>QR Code Generator</h3><p>Generate QR codes as PNG or SVG</p></div>
-      <div class="tool-card"><div class="tool-icon">&#128200;</div><h3>JSON/CSV Viewer</h3><p>Sortable, filterable data table from any file</p></div>
+      <div class="tool-card"><div class="tool-icon">&#128200;</div><h3>Data Viewer</h3><p>Sortable, filterable data table from JSON or CSV</p></div>
     </div>
   </div>
 </section>
@@ -715,7 +716,7 @@
     <div class="benefit-card reveal reveal-delay-4">
       <div class="benefit-icon">&#128161;</div>
       <h3>Consistent Experience</h3>
-      <p>Same interface, same shortcuts, same quality across all 16 tools. Learn once, use everywhere.</p>
+      <p>Same interface, same shortcuts, same quality across all 15 tools. Learn once, use everywhere.</p>
     </div>
   </div>
 </section>
@@ -738,7 +739,7 @@
     <div class="step reveal reveal-delay-3">
       <div class="step-number">2</div>
       <h3>Pick a Tool</h3>
-      <p>Browse the sidebar. 16 tools organized into 5 clear categories.</p>
+      <p>Browse the sidebar. 15 tools organized into 5 clear categories.</p>
     </div>
     <div class="step reveal reveal-delay-4">
       <div class="step-number">3</div>
@@ -797,7 +798,7 @@
           const progress = Math.min(elapsed / duration, 1);
           // Ease out cubic
           const eased = 1 - Math.pow(1 - progress, 3);
-          entry.target.textContent = Math.round(target * eased);
+          entry.target.textContent = Math.round(target * eased).toLocaleString();
           if (progress < 1) requestAnimationFrame(update);
         }
         requestAnimationFrame(update);
