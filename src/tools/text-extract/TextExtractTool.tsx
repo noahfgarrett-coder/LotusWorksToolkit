@@ -6,7 +6,7 @@ import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
 import { FileDropZone } from '@/components/common/FileDropZone.tsx'
 import { Button } from '@/components/common/Button.tsx'
 import { ProgressBar } from '@/components/common/ProgressBar.tsx'
-import { loadPDFFile, renderPageToCanvas, hasEmbeddedText, extractPositionedText, extractPageLines } from '@/utils/pdf.ts'
+import { loadPDFFile, renderPageToCanvas, hasEmbeddedText, extractPositionedText, extractPageLines, removePDFFromCache } from '@/utils/pdf.ts'
 import type { PageLine } from '@/utils/pdf.ts'
 import { downloadBlob, downloadText } from '@/utils/download.ts'
 import type { PDFFile } from '@/types'
@@ -1433,6 +1433,7 @@ export default function TextExtractTool() {
         {/* New */}
         <button
           onClick={() => {
+            if (pdfFile) removePDFFromCache(pdfFile.id)
             setPdfFile(null)
             setExtractedItems([])
             setTableData(null)

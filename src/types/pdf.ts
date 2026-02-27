@@ -2,7 +2,7 @@
 export interface PDFFile {
   id: string
   name: string
-  data: Uint8Array
+  file: File
   pageCount: number
   size: number
 }

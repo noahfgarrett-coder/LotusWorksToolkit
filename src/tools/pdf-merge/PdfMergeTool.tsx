@@ -225,8 +225,8 @@ export default function PdfMergeTool() {
   const memoryMB = useMemo(() => {
     let bytes = 0
     for (const f of files) {
-      bytes += f.data.byteLength
-      if (f.pages.length > 0) bytes += f.data.byteLength * 1.5
+      // File reference costs ~0 bytes. Estimate pdfjs cached doc as ~1x file size.
+      bytes += f.size
       if (f.thumbnail) bytes += f.thumbnail.length * 2
       for (const p of f.pages) {
         if (p.thumbnail) bytes += p.thumbnail.length * 2
@@ -474,11 +474,11 @@ export default function PdfMergeTool() {
           if (f.pages.length > 0) {
             const includedPages = f.pages.filter((p) => !p.excluded).map((p) => p.pageNumber)
             if (includedPages.length === 0) return null
-            return { data: f.data, pages: includedPages }
+            return { file: f.file, pages: includedPages }
           }
-          return { data: f.data }
+          return { file: f.file }
         })
-        .filter((x): x is { data: Uint8Array; pages?: number[] } => x !== null)
+        .filter((x): x is { file: File; pages?: number[] } => x !== null)
 
       if (mergeInputs.length === 0) {
         setIsMerging(false)

@@ -38,15 +38,17 @@ function evictOldest() {
 }
 
 /** Get or load a pdfjs document from cache */
-async function getCachedDoc(fileId: string, data: Uint8Array): Promise<pdfjsLib.PDFDocumentProxy> {
+async function getCachedDoc(fileId: string, file: File): Promise<pdfjsLib.PDFDocumentProxy> {
   const cached = docCache.get(fileId)
   if (cached) {
     cached.lastAccess = Date.now()
     return cached.doc
   }
 
+  // Cache miss — read bytes from disk, parse, cache, let bytes GC
   evictOldest()
-  const doc = await pdfjsLib.getDocument({ data: data.slice() }).promise
+  const buffer = await file.arrayBuffer()
+  const doc = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise
   docCache.set(fileId, { doc, lastAccess: Date.now() })
   return doc
 }
@@ -56,18 +58,30 @@ export function generateId(): string {
 }
 
 /**
+ * Read raw bytes from a PDFFile's underlying File object.
+ * Each call reads from disk — the returned Uint8Array is ephemeral.
+ * Callers should let it GC after use (do not store in state).
+ */
+export async function getPDFBytes(pdfFile: PDFFile): Promise<Uint8Array> {
+  const buffer = await pdfFile.file.arrayBuffer()
+  return new Uint8Array(buffer)
+}
+
+/**
  * Load a PDF file from a browser File object.
- * Returns metadata and the raw bytes.
+ * Returns metadata and a reference to the File (bytes are NOT retained in memory).
  */
 export async function loadPDFFile(file: File): Promise<PDFFile> {
-  const buffer = await file.arrayBuffer()
-  const data = new Uint8Array(buffer)
-
-  if (data.length === 0) {
+  if (file.size === 0) {
     throw new Error('File is empty')
   }
 
-  const doc = await pdfjsLib.getDocument({ data: data.slice() }).promise
+  // Read bytes once for initial pdfjs parse, then let them GC.
+  // pdfjs copies data to its worker internally.
+  const buffer = await file.arrayBuffer()
+  const data = new Uint8Array(buffer)
+
+  const doc = await pdfjsLib.getDocument({ data }).promise
   const pageCount = doc.numPages
 
   if (pageCount === 0) {
@@ -83,7 +97,7 @@ export async function loadPDFFile(file: File): Promise<PDFFile> {
   return {
     id,
     name: file.name,
-    data,
+    file,
     pageCount,
     size: file.size,
   }
@@ -98,7 +112,7 @@ export async function generateThumbnail(
   pageNumber: number,
   targetHeight: number = 200,
 ): Promise<string> {
-  const doc = await getCachedDoc(pdfFile.id, pdfFile.data)
+  const doc = await getCachedDoc(pdfFile.id, pdfFile.file)
 
   if (pageNumber < 1 || pageNumber > doc.numPages) {
     throw new Error(`Invalid page number ${pageNumber}`)
@@ -162,7 +176,7 @@ export async function renderPageToCanvas(
   scale: number = 1.5,
   rotation: number = 0,
 ): Promise<void> {
-  const doc = await getCachedDoc(pdfFile.id, pdfFile.data)
+  const doc = await getCachedDoc(pdfFile.id, pdfFile.file)
   const page = await doc.getPage(pageNumber)
   const viewport = page.getViewport({ scale, rotation })
 
@@ -249,15 +263,17 @@ export function parsePageRange(rangeStr: string, maxPages: number): number[] {
  * Operates on raw Uint8Array data - no filesystem needed.
  */
 export async function mergePDFs(
-  files: { data: Uint8Array; pages?: number[] }[],
+  files: { file: File; pages?: number[] }[],
   onProgress?: (current: number, total: number) => void,
 ): Promise<Uint8Array> {
   const mergedPdf = await PDFDocument.create()
   const total = files.length
 
   for (let i = 0; i < files.length; i++) {
-    const { data, pages } = files[i]
-    const sourcePdf = await PDFDocument.load(data)
+    const { file, pages } = files[i]
+    // Read bytes on demand — each file's buffer is GC-eligible after this iteration
+    const buffer = await file.arrayBuffer()
+    const sourcePdf = await PDFDocument.load(new Uint8Array(buffer))
 
     const pagesToCopy = pages
       ? pages.map((p) => p - 1)
@@ -279,21 +295,22 @@ export async function mergePDFs(
  * Each entry specifies a source file and a single page number.
  */
 export async function mergePDFPages(
-  entries: { data: Uint8Array; pageNumber: number }[],
+  entries: { file: File; pageNumber: number }[],
   onProgress?: (current: number, total: number) => void,
 ): Promise<Uint8Array> {
   const mergedPdf = await PDFDocument.create()
-  // Cache loaded PDFs by data reference to avoid re-parsing
-  const pdfCache = new Map<Uint8Array, PDFDocument>()
+  // Cache loaded PDFs by File reference to avoid re-parsing
+  const pdfCache = new Map<File, PDFDocument>()
 
   for (let i = 0; i < entries.length; i++) {
-    const { data, pageNumber } = entries[i]
+    const { file, pageNumber } = entries[i]
 
-    if (!pdfCache.has(data)) {
-      pdfCache.set(data, await PDFDocument.load(data))
+    if (!pdfCache.has(file)) {
+      const buffer = await file.arrayBuffer()
+      pdfCache.set(file, await PDFDocument.load(new Uint8Array(buffer)))
     }
 
-    const sourcePdf = pdfCache.get(data)!
+    const sourcePdf = pdfCache.get(file)!
     const [copiedPage] = await mergedPdf.copyPages(sourcePdf, [pageNumber - 1])
     mergedPdf.addPage(copiedPage)
 
@@ -312,10 +329,11 @@ export async function mergePDFPages(
  * Returns the new PDF as Uint8Array.
  */
 export async function extractPages(
-  data: Uint8Array,
+  file: File,
   pageNumbers: number[],
 ): Promise<Uint8Array> {
-  const sourcePdf = await PDFDocument.load(data)
+  const buffer = await file.arrayBuffer()
+  const sourcePdf = await PDFDocument.load(new Uint8Array(buffer))
   const newPdf = await PDFDocument.create()
 
   const indices = pageNumbers.map((p) => p - 1)
@@ -333,12 +351,13 @@ export async function extractPages(
  * Returns an array of { name, data } objects.
  */
 export async function splitPDF(
-  data: Uint8Array,
+  file: File,
   baseName: string,
   splits: { pages: number[]; name?: string }[],
   onProgress?: (current: number, total: number) => void,
 ): Promise<{ name: string; data: Uint8Array }[]> {
-  const sourcePdf = await PDFDocument.load(data)
+  const buffer = await file.arrayBuffer()
+  const sourcePdf = await PDFDocument.load(new Uint8Array(buffer))
   const results: { name: string; data: Uint8Array }[] = []
 
   for (let i = 0; i < splits.length; i++) {
@@ -365,11 +384,12 @@ export async function splitPDF(
  * Split every page into its own PDF.
  */
 export async function splitToSinglePages(
-  data: Uint8Array,
+  file: File,
   baseName: string,
   onProgress?: (current: number, total: number) => void,
 ): Promise<{ name: string; data: Uint8Array }[]> {
-  const sourcePdf = await PDFDocument.load(data)
+  const buffer = await file.arrayBuffer()
+  const sourcePdf = await PDFDocument.load(new Uint8Array(buffer))
   const totalPages = sourcePdf.getPageCount()
   const results: { name: string; data: Uint8Array }[] = []
   const pad = String(totalPages).length
@@ -400,7 +420,7 @@ export async function extractPageText(
   pdfFile: PDFFile,
   pageNumber: number,
 ): Promise<string> {
-  const doc = await getCachedDoc(pdfFile.id, pdfFile.data)
+  const doc = await getCachedDoc(pdfFile.id, pdfFile.file)
   const page = await doc.getPage(pageNumber)
   const textContent = await page.getTextContent()
 
@@ -467,13 +487,14 @@ export async function hasEmbeddedText(
 export async function extractPositionedText(
   pdfFile: PDFFile,
   pageNumber: number,
+  rotation: number = 0,
 ): Promise<{
   items: { text: string; x: number; y: number; width: number; height: number; page: number }[]
   viewport: { width: number; height: number }
 }> {
-  const doc = await getCachedDoc(pdfFile.id, pdfFile.data)
+  const doc = await getCachedDoc(pdfFile.id, pdfFile.file)
   const page = await doc.getPage(pageNumber)
-  const viewport = page.getViewport({ scale: 1 })
+  const viewport = page.getViewport({ scale: 1, rotation })
   const content = await page.getTextContent()
   const items: { text: string; x: number; y: number; width: number; height: number; page: number }[] = []
   for (const item of content.items) {
@@ -508,7 +529,7 @@ export async function extractPageLines(
   pdfFile: PDFFile,
   pageNumber: number,
 ): Promise<{ horizontal: PageLine[]; vertical: PageLine[] }> {
-  const doc = await getCachedDoc(pdfFile.id, pdfFile.data)
+  const doc = await getCachedDoc(pdfFile.id, pdfFile.file)
   const page = await doc.getPage(pageNumber)
   const viewport = page.getViewport({ scale: 1 })
   const ops = await page.getOperatorList()

@@ -7,7 +7,6 @@ interface FileDropZoneProps {
   multiple?: boolean
   label?: string
   description?: string
-  maxSizeMB?: number
   className?: string
 }
 
@@ -17,7 +16,6 @@ export const FileDropZone = memo(function FileDropZone({
   multiple = true,
   label = 'Drop files here',
   description = 'or click to browse',
-  maxSizeMB = 50,
   className = '',
 }: FileDropZoneProps) {
   const [isDragOver, setIsDragOver] = useState(false)
@@ -26,12 +24,10 @@ export const FileDropZone = memo(function FileDropZone({
   const handleFiles = useCallback(
     (fileList: FileList | null) => {
       if (!fileList || fileList.length === 0) return
-      const files = Array.from(fileList).filter(
-        (f) => f.size <= maxSizeMB * 1024 * 1024,
-      )
+      const files = Array.from(fileList)
       if (files.length > 0) onFiles(files)
     },
-    [onFiles, maxSizeMB],
+    [onFiles],
   )
 
   const handleDrop = useCallback(
@@ -80,9 +76,6 @@ export const FileDropZone = memo(function FileDropZone({
       </div>
       <p className="text-sm font-medium text-white mb-1">{label}</p>
       <p className="text-xs text-white/40">{description}</p>
-      {maxSizeMB && (
-        <p className="text-[10px] text-white/25 mt-2">Max {maxSizeMB}MB per file</p>
-      )}
       <input
         ref={inputRef}
         type="file"

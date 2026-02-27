@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
 import { FileDropZone } from '@/components/common/FileDropZone.tsx'
 import { Button } from '@/components/common/Button.tsx'
 import { ProgressBar } from '@/components/common/ProgressBar.tsx'
-import { loadPDFFile, generateThumbnail, extractPages } from '@/utils/pdf.ts'
+import { loadPDFFile, generateThumbnail, extractPages, splitPDF, removePDFFromCache, validatePageRange } from '@/utils/pdf.ts'
 import { downloadBlob } from '@/utils/download.ts'
 import { formatFileSize } from '@/utils/fileReader.ts'
 import type { PDFFile } from '@/types'
@@ -13,7 +13,7 @@ import type { DragStartEvent, DragEndEvent } from '@dnd-kit/core'
 import { SortableContext, useSortable, rectSortingStrategy, arrayMove } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import {
-  Download, RotateCcw, ZoomIn, ZoomOut, Loader2, FilePlus,
+  Download, RotateCcw, ZoomIn, ZoomOut, Loader2, FilePlus, Plus,
   Trash2, X, Pencil, Check, Package, Lock, Unlock,
 } from 'lucide-react'
 import JSZip from 'jszip'
@@ -39,6 +39,7 @@ interface OutputDocument {
 let _uid = 0
 function makeUid(): string { return `sp-${++_uid}` }
 function makeDocId(): string { return `doc-${++_uid}` }
+function makeSlotId(): string { return `slot-${++_uid}` }
 
 const DOC_COLORS = ['#F47B20', '#3B82F6', '#22C55E', '#A855F7', '#EC4899', '#14B8A6', '#F59E0B', '#6366F1']
 
@@ -83,6 +84,7 @@ interface SourcePageItemProps {
   otherDocColors: string[]
   activeDocColor: string | null
   isAssignedToActive: boolean
+  duplicateCount: number
   onMouseDown: (e: React.MouseEvent) => void
   onMouseEnter: (e: React.MouseEvent) => void
   scrollRoot: HTMLDivElement | null
@@ -90,7 +92,7 @@ interface SourcePageItemProps {
 }
 
 function SourcePageItem({
-  page, otherDocColors, activeDocColor, isAssignedToActive,
+  page, otherDocColors, activeDocColor, isAssignedToActive, duplicateCount,
   onMouseDown, onMouseEnter, scrollRoot, onThumbnailNeeded,
 }: SourcePageItemProps) {
   const nodeRef = useRef<HTMLDivElement | null>(null)
@@ -176,6 +178,16 @@ function SourcePageItem({
           <Check size={11} className="text-white" strokeWidth={3} />
         </div>
       )}
+
+      {/* Duplicate count badge */}
+      {duplicateCount > 1 && activeDocColor && (
+        <div
+          className="absolute bottom-1.5 right-1.5 px-1 py-0.5 rounded text-[9px] font-bold leading-none"
+          style={{ backgroundColor: activeDocColor, color: 'white' }}
+        >
+          &times;{duplicateCount}
+        </div>
+      )}
     </div>
   )
 }
@@ -244,6 +256,8 @@ export default function PdfSplitTool() {
   const [editingDocId, setEditingDocId] = useState<string | null>(null)
   const [editingName, setEditingName] = useState('')
   const [docCounter, setDocCounter] = useState(0)
+  const [rangeInput, setRangeInput] = useState('')
+  const [rangeError, setRangeError] = useState<string | null>(null)
 
   // Paint-select state
   const isPainting = useRef(false)
@@ -270,11 +284,16 @@ export default function PdfSplitTool() {
   pdfRef.current = pdfFile
   const loadingThumbs = useRef(new Set<string>())
 
+  // Slot-based model: maps slot UIDs → source page info (enables duplicate pages)
+  const slotPageMap = useRef(new Map<string, { sourceUid: string; pageNumber: number }>())
+
   // Refs for paint callbacks (avoid stale closures)
   const activeDocIdRef = useRef(activeDocId)
   activeDocIdRef.current = activeDocId
   const pagesRef = useRef(pages)
   pagesRef.current = pages
+  const outputDocsRef = useRef(outputDocs)
+  outputDocsRef.current = outputDocs
 
   // dnd-kit sensors for sidebar reorder
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }))
@@ -346,28 +365,43 @@ export default function PdfSplitTool() {
     }
   }, [])
 
-  /* ── Assign / unassign a page to/from the active doc ── */
+  /* ── Assign / unassign a page to/from the active doc (slot-based) ── */
 
-  const assignPage = useCallback((pageUid: string) => {
+  const assignPage = useCallback((pageUid: string, pageNumber: number) => {
     const docId = activeDocIdRef.current
     if (!docId) return
 
+    const slotId = makeSlotId()
+    slotPageMap.current.set(slotId, { sourceUid: pageUid, pageNumber })
+
+    // Mark source page as assigned to this doc (idempotent — for color dot display)
     setPages((prev) => prev.map((p) => {
       if (p.uid !== pageUid) return p
-      if (p.assignedTo.includes(docId)) return p  // already assigned
+      if (p.assignedTo.includes(docId)) return p
       return { ...p, assignedTo: [...p.assignedTo, docId] }
     }))
 
     setOutputDocs((prev) => prev.map((d) => {
       if (d.id !== docId) return d
-      if (d.pageUids.includes(pageUid)) return d  // already in list
-      return { ...d, pageUids: [...d.pageUids, pageUid] }
+      return { ...d, pageUids: [...d.pageUids, slotId] }
     }))
   }, [])
 
   const unassignPage = useCallback((pageUid: string) => {
     const docId = activeDocIdRef.current
     if (!docId) return
+
+    // Find all slots in the active doc that map to this source page
+    const activeDoc = outputDocsRef.current.find((d) => d.id === docId)
+    if (!activeDoc) return
+    const slotsToRemove = activeDoc.pageUids.filter((slotId) => {
+      const info = slotPageMap.current.get(slotId)
+      return info?.sourceUid === pageUid
+    })
+    for (const slotId of slotsToRemove) {
+      slotPageMap.current.delete(slotId)
+    }
+    const removeSet = new Set(slotsToRemove)
 
     setPages((prev) => prev.map((p) => {
       if (p.uid !== pageUid) return p
@@ -376,39 +410,49 @@ export default function PdfSplitTool() {
 
     setOutputDocs((prev) => prev.map((d) => {
       if (d.id !== docId) return d
-      return { ...d, pageUids: d.pageUids.filter((u) => u !== pageUid) }
+      return { ...d, pageUids: d.pageUids.filter((s) => !removeSet.has(s)) }
     }))
   }, [])
 
   /* ── Paint-select: mousedown starts, mouseenter continues, mouseup ends ── */
 
-  const handlePageMouseDown = useCallback((e: React.MouseEvent, pageUid: string) => {
+  const shiftHeldRef = useRef(false)
+
+  const handlePageMouseDown = useCallback((e: React.MouseEvent, pageUid: string, pageNumber: number) => {
     e.preventDefault()
     if (!activeDocIdRef.current) return
 
     const page = pagesRef.current.find((p) => p.uid === pageUid)
     if (!page) return
 
+    shiftHeldRef.current = e.shiftKey
     isPainting.current = true
     paintedThisStroke.current = new Set([pageUid])
 
-    // Determine paint mode: if page is in the active doc, unassign; otherwise assign
+    // Shift+Click: always add a duplicate copy
+    if (e.shiftKey) {
+      paintMode.current = 'assign'
+      assignPage(pageUid, pageNumber)
+      return
+    }
+
+    // Normal click: toggle assign/unassign
     if (page.assignedTo.includes(activeDocIdRef.current)) {
       paintMode.current = 'unassign'
       unassignPage(pageUid)
     } else {
       paintMode.current = 'assign'
-      assignPage(pageUid)
+      assignPage(pageUid, pageNumber)
     }
   }, [assignPage, unassignPage])
 
-  const handlePageMouseEnter = useCallback((_e: React.MouseEvent, pageUid: string) => {
+  const handlePageMouseEnter = useCallback((_e: React.MouseEvent, pageUid: string, pageNumber: number) => {
     if (!isPainting.current || !activeDocIdRef.current) return
     if (paintedThisStroke.current.has(pageUid)) return
     paintedThisStroke.current.add(pageUid)
 
     if (paintMode.current === 'assign') {
-      assignPage(pageUid)
+      assignPage(pageUid, pageNumber)
     } else {
       unassignPage(pageUid)
     }
@@ -444,24 +488,54 @@ export default function PdfSplitTool() {
     setActiveDocId(newDocId)
   }, [docCounter])
 
+  // Enter/Return creates a new document (skip when typing in inputs)
+  useEffect(() => {
+    if (!pdfFile) return
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Enter') return
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      e.preventDefault()
+      createNewDocument()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [pdfFile, createNewDocument])
+
   /* ── Edit (unlock) a locked document ── */
 
   const editDocument = useCallback((docId: string) => {
     setActiveDocId(docId)
   }, [])
 
-  /* ── Remove page from a specific document ── */
+  /* ── Remove a single slot from a specific document ── */
 
-  const removePageFromDoc = useCallback((docId: string, pageUid: string) => {
-    setOutputDocs((prev) => prev.map((d) => {
-      if (d.id !== docId) return d
-      return { ...d, pageUids: d.pageUids.filter((u) => u !== pageUid) }
-    }))
+  const removeSlotFromDoc = useCallback((docId: string, slotId: string) => {
+    const info = slotPageMap.current.get(slotId)
+    slotPageMap.current.delete(slotId)
 
-    setPages((prev) => prev.map((p) => {
-      if (p.uid !== pageUid) return p
-      return { ...p, assignedTo: p.assignedTo.filter((id) => id !== docId) }
-    }))
+    setOutputDocs((prev) => {
+      const updated = prev.map((d) => {
+        if (d.id !== docId) return d
+        return { ...d, pageUids: d.pageUids.filter((s) => s !== slotId) }
+      })
+
+      // Check if any remaining slots in this doc still reference the same source page
+      if (info) {
+        const doc = updated.find((d) => d.id === docId)
+        const stillHasPage = doc?.pageUids.some((s) => {
+          const i = slotPageMap.current.get(s)
+          return i?.sourceUid === info.sourceUid
+        })
+        if (!stillHasPage) {
+          setPages((p) => p.map((pg) => {
+            if (pg.uid !== info.sourceUid) return pg
+            return { ...pg, assignedTo: pg.assignedTo.filter((id) => id !== docId) }
+          }))
+        }
+      }
+
+      return updated
+    })
   }, [])
 
   /* ── Delete entire document ── */
@@ -470,9 +544,16 @@ export default function PdfSplitTool() {
     const doc = outputDocs.find((d) => d.id === docId)
     if (!doc) return
 
-    const uidsInDoc = new Set(doc.pageUids)
+    // Collect source page UIDs from slots, then clean up slots
+    const sourceUids = new Set<string>()
+    for (const slotId of doc.pageUids) {
+      const info = slotPageMap.current.get(slotId)
+      if (info) sourceUids.add(info.sourceUid)
+      slotPageMap.current.delete(slotId)
+    }
+
     setPages((prev) => prev.map((p) => {
-      if (!uidsInDoc.has(p.uid)) return p
+      if (!sourceUids.has(p.uid)) return p
       return { ...p, assignedTo: p.assignedTo.filter((id) => id !== docId) }
     }))
     setOutputDocs((prev) => prev.filter((d) => d.id !== docId))
@@ -550,15 +631,19 @@ export default function PdfSplitTool() {
     try {
       const total = docsWithPages.length
 
+      // Map slot IDs → page numbers through slotPageMap
+      const slotToPageNumber = (slotId: string): number | undefined =>
+        slotPageMap.current.get(slotId)?.pageNumber
+
       if (total === 1) {
         const doc = docsWithPages[0]
         const pageNumbers = doc.pageUids
-          .map((uid) => pages.find((p) => p.uid === uid)?.pageNumber)
+          .map(slotToPageNumber)
           .filter((n): n is number => n != null)
 
         if (pageNumbers.length === 0) return
 
-        const result = await extractPages(pdfFile.data, pageNumbers)
+        const result = await extractPages(pdfFile.file, pageNumbers)
         const blob = new Blob([result], { type: 'application/pdf' })
         const fileName = doc.name.endsWith('.pdf') ? doc.name : `${doc.name}.pdf`
 
@@ -570,18 +655,21 @@ export default function PdfSplitTool() {
       } else {
         const zip = new JSZip()
 
-        for (let i = 0; i < total; i++) {
-          const doc = docsWithPages[i]
+        // Build splits array for single-parse approach (source PDF parsed once, not per output doc)
+        const splits = docsWithPages.map((doc) => {
           const pageNumbers = doc.pageUids
-            .map((uid) => pages.find((p) => p.uid === uid)?.pageNumber)
+            .map(slotToPageNumber)
             .filter((n): n is number => n != null)
-
-          if (pageNumbers.length === 0) continue
-
-          const result = await extractPages(pdfFile.data, pageNumbers)
           const fileName = doc.name.endsWith('.pdf') ? doc.name : `${doc.name}.pdf`
-          zip.file(fileName, result)
-          setProgress(Math.round(((i + 1) / total) * 80))
+          return { pages: pageNumbers, name: fileName }
+        }).filter((s) => s.pages.length > 0)
+
+        const results = await splitPDF(pdfFile.file, '', splits, (current, splitTotal) => {
+          setProgress(Math.round((current / splitTotal) * 80))
+        })
+
+        for (const { name, data } of results) {
+          zip.file(name, data)
         }
 
         const zipBlob = await zip.generateAsync(
@@ -630,15 +718,30 @@ export default function PdfSplitTool() {
   const totalAssigned = useMemo(() => pages.filter((p) => p.assignedTo.length > 0).length, [pages])
   const docsWithPages = useMemo(() => outputDocs.filter((d) => d.pageUids.length > 0).length, [outputDocs])
 
+  /** Count how many slots in the active doc reference a given source page */
+  const getDuplicateCount = (sourceUid: string): number => {
+    if (!activeDoc) return 0
+    let count = 0
+    for (const slotId of activeDoc.pageUids) {
+      const info = slotPageMap.current.get(slotId)
+      if (info?.sourceUid === sourceUid) count++
+    }
+    return count
+  }
+
   /* ── Reset ── */
 
   const handleReset = () => {
+    if (pdfFile) removePDFFromCache(pdfFile.id)
     setPdfFile(null)
     setPages([])
     setOutputDocs([])
     setActiveDocId(null)
     setDocCounter(0)
+    setRangeInput('')
+    setRangeError(null)
     loadingThumbs.current.clear()
+    slotPageMap.current.clear()
   }
 
   /* ── Render: empty state ── */
@@ -757,8 +860,9 @@ export default function PdfSplitTool() {
                 otherDocColors={getOtherDocColors(page)}
                 activeDocColor={activeDocColor}
                 isAssignedToActive={page.assignedTo.includes(activeDocId ?? '')}
-                onMouseDown={(e) => handlePageMouseDown(e, page.uid)}
-                onMouseEnter={(e) => handlePageMouseEnter(e, page.uid)}
+                duplicateCount={getDuplicateCount(page.uid)}
+                onMouseDown={(e) => handlePageMouseDown(e, page.uid, page.pageNumber)}
+                onMouseEnter={(e) => handlePageMouseEnter(e, page.uid, page.pageNumber)}
                 scrollRoot={scrollRef.current}
                 onThumbnailNeeded={() => loadPageThumbnail(page.uid, page.pageNumber)}
               />
@@ -768,7 +872,7 @@ export default function PdfSplitTool() {
 
         {/* Footer hint */}
         <p className="text-[10px] text-white/25 text-center flex-shrink-0 px-1">
-          Click or drag to paint pages · Pages can belong to multiple documents · Press "New Document" to start another
+          Click or drag to paint pages · Shift+Click to add duplicates · Press Enter to start a new document
         </p>
       </div>
 
@@ -881,16 +985,16 @@ export default function PdfSplitTool() {
                       >
                         <SortableContext items={doc.pageUids} strategy={rectSortingStrategy}>
                           <div className="flex flex-wrap gap-1">
-                            {doc.pageUids.map((uid) => {
-                              const page = pages.find((p) => p.uid === uid)
-                              if (!page) return null
+                            {doc.pageUids.map((slotId) => {
+                              const info = slotPageMap.current.get(slotId)
+                              if (!info) return null
                               return (
                                 <SortablePageChip
-                                  key={uid}
-                                  uid={uid}
-                                  pageNumber={page.pageNumber}
+                                  key={slotId}
+                                  uid={slotId}
+                                  pageNumber={info.pageNumber}
                                   docColor={doc.color}
-                                  onRemove={() => removePageFromDoc(doc.id, uid)}
+                                  onRemove={() => removeSlotFromDoc(doc.id, slotId)}
                                   isActiveDoc={isActive}
                                 />
                               )
@@ -899,14 +1003,14 @@ export default function PdfSplitTool() {
                         </SortableContext>
                         <DragOverlay>
                           {activeDragId && (() => {
-                            const page = pages.find((p) => p.uid === activeDragId)
-                            if (!page) return null
+                            const info = slotPageMap.current.get(activeDragId)
+                            if (!info) return null
                             return (
                               <div
                                 className="inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-medium shadow-lg"
                                 style={{ backgroundColor: doc.color, color: 'white' }}
                               >
-                                {page.pageNumber}
+                                {info.pageNumber}
                               </div>
                             )
                           })()}
@@ -938,6 +1042,51 @@ export default function PdfSplitTool() {
           >
             New Document
           </Button>
+
+          {/* Page range bulk-add */}
+          {activeDoc && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault()
+                if (!pdfFile || !rangeInput.trim()) return
+                const result = validatePageRange(rangeInput.trim(), pdfFile.pageCount)
+                if (!result.valid) {
+                  setRangeError(result.error ?? 'Invalid range')
+                  return
+                }
+                if (result.pages.length === 0) {
+                  setRangeError('No pages specified')
+                  return
+                }
+                for (const pageNum of result.pages) {
+                  const sourcePage = pages.find((p) => p.pageNumber === pageNum)
+                  if (sourcePage) assignPage(sourcePage.uid, sourcePage.pageNumber)
+                }
+                setRangeInput('')
+                setRangeError(null)
+              }}
+              className="flex items-center gap-1"
+            >
+              <input
+                type="text"
+                value={rangeInput}
+                onChange={(e) => { setRangeInput(e.target.value); setRangeError(null) }}
+                placeholder="e.g., 1-50, 75-100"
+                className="flex-1 min-w-0 px-2 py-1 text-[11px] bg-white/[0.04] border border-white/[0.08] rounded-md text-white placeholder:text-white/20 outline-none focus:border-[#F47B20]/40 transition-colors"
+              />
+              <button
+                type="submit"
+                className="p-1 rounded-md bg-white/[0.06] text-white/40 hover:text-white/70 hover:bg-white/[0.1] transition-colors"
+                title="Add pages by range"
+                aria-label="Add pages by range"
+              >
+                <Plus size={14} />
+              </button>
+            </form>
+          )}
+          {rangeError && (
+            <p className="text-[10px] text-red-400 px-0.5">{rangeError}</p>
+          )}
 
           {exportError && (
             <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-red-500/10 border border-red-500/20">

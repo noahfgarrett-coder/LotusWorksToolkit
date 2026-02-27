@@ -357,7 +357,6 @@ export default function ConverterTool() {
         multiple
         label="Drop more files"
         description="Add more files to convert"
-        maxSizeMB={50}
         className="py-4 flex-shrink-0"
       />
     </div>

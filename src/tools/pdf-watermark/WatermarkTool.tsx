@@ -2,7 +2,7 @@ import { useState, useCallback, useRef, useEffect } from 'react'
 import { FileDropZone } from '@/components/common/FileDropZone.tsx'
 import { Button } from '@/components/common/Button.tsx'
 import { Slider } from '@/components/common/Slider.tsx'
-import { loadPDFFile, renderPageToCanvas } from '@/utils/pdf.ts'
+import { loadPDFFile, renderPageToCanvas, removePDFFromCache, getPDFBytes } from '@/utils/pdf.ts'
 import { downloadBlob } from '@/utils/download.ts'
 import { formatFileSize, readFileAsDataURL, readFileAsUint8Array } from '@/utils/fileReader.ts'
 import { loadImage } from '@/utils/imageProcessing.ts'
@@ -329,7 +329,8 @@ export default function WatermarkTool() {
     setIsProcessing(true)
     setApplyError(null)
     try {
-      const doc = await PDFDocument.load(pdfFile.data)
+      const bytes = await getPDFBytes(pdfFile)
+      const doc = await PDFDocument.load(bytes)
       const pages = doc.getPages()
 
       if (watermarkType === 'text') {
@@ -712,6 +713,7 @@ export default function WatermarkTool() {
           <Button
             variant="ghost"
             onClick={() => {
+              if (pdfFile) removePDFFromCache(pdfFile.id)
               setPdfFile(null)
               setCustomOffset(null)
             }}

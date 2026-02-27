@@ -138,7 +138,6 @@ export function DataImporter({ store, fileHandle, onSuccess, onCancel }: DataImp
         multiple
         label="Drop spreadsheet files here"
         description={`Supports ${SUPPORTED_EXTENSIONS.join(', ')}`}
-        maxSizeMB={100}
       />
 
       {/* FSA picker button */}
