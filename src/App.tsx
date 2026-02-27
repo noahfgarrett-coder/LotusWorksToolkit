@@ -1,9 +1,12 @@
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useState, useEffect } from 'react'
 import { useAppStore } from '@/stores/appStore.ts'
 import { AppShell } from '@/components/layout/AppShell.tsx'
 import { ToolContainer } from '@/components/layout/ToolContainer.tsx'
 import { WelcomeScreen } from '@/components/WelcomeScreen.tsx'
 import { ErrorBoundary } from '@/components/common/ErrorBoundary.tsx'
+import { UpdateModal } from '@/components/common/UpdateModal.tsx'
+import { checkForUpdate } from '@/utils/updateChecker.ts'
+import type { UpdateInfo } from '@/utils/updateChecker.ts'
 import type { ToolId } from '@/types/index.ts'
 
 // Lazy-load each tool
@@ -35,6 +38,17 @@ function LoadingFallback() {
 
 export default function App() {
   const activeTool = useAppStore((s) => s.activeTool)
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
+  const [showUpdateModal, setShowUpdateModal] = useState(false)
+
+  useEffect(() => {
+    checkForUpdate().then((info) => {
+      if (info) {
+        setUpdateInfo(info)
+        setShowUpdateModal(true)
+      }
+    })
+  }, [])
 
   const ActiveComponent = activeTool ? toolComponents[activeTool] : null
 
@@ -50,6 +64,13 @@ export default function App() {
         </ToolContainer>
       ) : (
         <WelcomeScreen />
+      )}
+      {updateInfo && (
+        <UpdateModal
+          open={showUpdateModal}
+          onClose={() => setShowUpdateModal(false)}
+          info={updateInfo}
+        />
       )}
     </AppShell>
   )

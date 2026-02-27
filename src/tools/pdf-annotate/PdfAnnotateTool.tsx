@@ -2,7 +2,7 @@ import { useState, useCallback, useRef, useEffect } from 'react'
 import { FileDropZone } from '@/components/common/FileDropZone.tsx'
 import { Button } from '@/components/common/Button.tsx'
 import { Modal } from '@/components/common/Modal.tsx'
-import { loadPDFFile, renderPageToCanvas, generateThumbnail } from '@/utils/pdf.ts'
+import { loadPDFFile, renderPageToCanvas, generateThumbnail, removePDFFromCache, getPDFBytes, extractPositionedText } from '@/utils/pdf.ts'
 import { downloadBlob } from '@/utils/download.ts'
 import { formatFileSize } from '@/utils/fileReader.ts'
 import type { PDFFile } from '@/types'
@@ -11,18 +11,19 @@ import {
   Download, RotateCcw, RotateCw, Undo2, Redo2,
   Pencil, Highlighter, Square, Circle, ArrowUpRight, Minus, Type, Eraser,
   ZoomIn, ZoomOut, Maximize, Cloud, ChevronDown, ChevronLeft, ChevronRight, PanelLeft,
-  MessageSquare, X, Ruler,
+  MessageSquare, X, Ruler, TextSelect,
+  Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight,
 } from 'lucide-react'
 
 // ── Types ──────────────────────────────────────────────
 
-type ToolType = 'pencil' | 'highlighter' | 'rectangle' | 'circle' | 'arrow' | 'line' | 'text' | 'eraser' | 'cloud' | 'callout' | 'measure'
+type ToolType = 'pencil' | 'highlighter' | 'rectangle' | 'circle' | 'arrow' | 'line' | 'text' | 'eraser' | 'cloud' | 'callout' | 'measure' | 'textHighlight'
 
 interface Point { x: number; y: number }
 
 interface Annotation {
   id: string
-  type: Exclude<ToolType, 'eraser' | 'measure'>
+  type: Exclude<ToolType, 'eraser' | 'measure' | 'textHighlight'>
   points: Point[]
   color: string
   strokeWidth: number
@@ -30,9 +31,15 @@ interface Annotation {
   text?: string
   fontSize?: number
   fontFamily?: string
+  bold?: boolean
+  italic?: boolean
+  underline?: boolean
+  textAlign?: 'left' | 'center' | 'right'
   width?: number   // textbox width (doc space) — text & callout
   height?: number  // textbox height (doc space) — text & callout
   arrows?: Point[] // callout only: arrow tip positions
+  smooth?: boolean // false = straight segments (eraser fragments from shapes)
+  rects?: { x: number; y: number; w: number; h: number }[] // text highlight rectangles
 }
 
 type PageAnnotations = Record<number, Annotation[]>
@@ -60,17 +67,17 @@ const DEFAULT_TEXTBOX_H = 50
 type ToolDef = { type: ToolType; icon: React.ComponentType<{ size?: number }>; label: string }
 
 const DRAW_TOOLS: ToolDef[] = [
-  { type: 'pencil', icon: Pencil, label: 'Pencil' },
-  { type: 'line', icon: Minus, label: 'Line' },
-  { type: 'arrow', icon: ArrowUpRight, label: 'Arrow' },
-  { type: 'rectangle', icon: Square, label: 'Rectangle' },
-  { type: 'circle', icon: Circle, label: 'Circle' },
-  { type: 'cloud', icon: Cloud, label: 'Cloud' },
+  { type: 'pencil', icon: Pencil, label: 'Pencil (P)' },
+  { type: 'line', icon: Minus, label: 'Line (L)' },
+  { type: 'arrow', icon: ArrowUpRight, label: 'Arrow (A)' },
+  { type: 'rectangle', icon: Square, label: 'Rectangle (R)' },
+  { type: 'circle', icon: Circle, label: 'Circle (C)' },
+  { type: 'cloud', icon: Cloud, label: 'Cloud (K)' },
 ]
 
 const TEXT_TOOLS: ToolDef[] = [
-  { type: 'text', icon: Type, label: 'Text' },
-  { type: 'callout', icon: MessageSquare, label: 'Callout' },
+  { type: 'text', icon: Type, label: 'Text (T)' },
+  { type: 'callout', icon: MessageSquare, label: 'Callout (O)' },
 ]
 
 const DRAW_TYPES = new Set(DRAW_TOOLS.map(s => s.type))
@@ -94,11 +101,48 @@ const PDF_FONT_MAP: Record<string, StandardFonts> = {
   'Comic Sans MS': StandardFonts.Helvetica, 'Impact': StandardFonts.Helvetica,
 }
 
+// Bold/Italic/BoldItalic variants for PDF export
+type FontVariantKey = 'regular' | 'bold' | 'italic' | 'boldItalic'
+const PDF_FONT_VARIANTS: Record<string, Record<FontVariantKey, StandardFonts>> = {
+  helvetica: {
+    regular: StandardFonts.Helvetica, bold: StandardFonts.HelveticaBold,
+    italic: StandardFonts.HelveticaOblique, boldItalic: StandardFonts.HelveticaBoldOblique,
+  },
+  timesRoman: {
+    regular: StandardFonts.TimesRoman, bold: StandardFonts.TimesRomanBold,
+    italic: StandardFonts.TimesRomanItalic, boldItalic: StandardFonts.TimesRomanBoldItalic,
+  },
+  courier: {
+    regular: StandardFonts.Courier, bold: StandardFonts.CourierBold,
+    italic: StandardFonts.CourierOblique, boldItalic: StandardFonts.CourierBoldOblique,
+  },
+}
+
+function resolvePdfFontFamily(ff: string): string {
+  const base = PDF_FONT_MAP[ff] || StandardFonts.Helvetica
+  if (base === StandardFonts.TimesRoman || base === StandardFonts.TimesRomanBold ||
+      base === StandardFonts.TimesRomanItalic || base === StandardFonts.TimesRomanBoldItalic) return 'timesRoman'
+  if (base === StandardFonts.Courier || base === StandardFonts.CourierBold ||
+      base === StandardFonts.CourierOblique || base === StandardFonts.CourierBoldOblique) return 'courier'
+  return 'helvetica'
+}
+
+function resolvePdfFont(ff: string, bold: boolean, italic: boolean): StandardFonts {
+  const family = resolvePdfFontFamily(ff)
+  const key: FontVariantKey = bold && italic ? 'boldItalic' : bold ? 'bold' : italic ? 'italic' : 'regular'
+  return PDF_FONT_VARIANTS[family][key]
+}
+
 const CURSOR_MAP: Record<ToolType, string> = {
   pencil: 'crosshair', highlighter: 'crosshair', line: 'crosshair',
   arrow: 'crosshair', rectangle: 'crosshair', circle: 'crosshair',
-  cloud: 'crosshair', text: 'crosshair', eraser: 'none',
-  callout: 'crosshair', measure: 'crosshair',
+  cloud: 'crosshair', text: 'text', eraser: 'none',
+  callout: 'crosshair', measure: 'crosshair', textHighlight: 'text',
+}
+
+const HANDLE_CURSOR_MAP: Record<string, string> = {
+  nw: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize', se: 'nwse-resize',
+  n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize',
 }
 
 function genId() { return crypto.randomUUID() }
@@ -133,8 +177,9 @@ async function saveWithPicker(
 
 // ── Text wrapping helper ─────────────────────────────
 
-function wrapText(text: string, maxWidth: number, fontSize: number): string[] {
-  const charWidth = fontSize * 0.6
+function wrapText(text: string, maxWidth: number, fontSize: number, bold = false, measureFn?: (text: string) => number): string[] {
+  const charWidth = fontSize * 0.6 * (bold ? 1.08 : 1)
+  const measure = measureFn || ((t: string) => t.length * charWidth)
   const result: string[] = []
   for (const line of text.split('\n')) {
     if (!line) { result.push(''); continue }
@@ -142,7 +187,7 @@ function wrapText(text: string, maxWidth: number, fontSize: number): string[] {
     let current = ''
     for (const word of words) {
       const test = current ? `${current} ${word}` : word
-      if (test.length * charWidth > maxWidth && current) {
+      if (measure(test) > maxWidth && current) {
         result.push(current)
         current = word
       } else {
@@ -241,14 +286,18 @@ function hitTestCalloutBox(pt: Point, ann: Annotation): boolean {
 
 // ── Resize handle helpers ────────────────────────────
 
-type HandleId = 'nw' | 'ne' | 'sw' | 'se'
+type HandleId = 'nw' | 'ne' | 'sw' | 'se' | 'n' | 'e' | 's' | 'w'
 
 function getHandles(x: number, y: number, w: number, h: number): { id: HandleId; x: number; y: number }[] {
   return [
     { id: 'nw', x, y },
+    { id: 'n', x: x + w / 2, y },
     { id: 'ne', x: x + w, y },
-    { id: 'sw', x, y: y + h },
+    { id: 'e', x: x + w, y: y + h / 2 },
     { id: 'se', x: x + w, y: y + h },
+    { id: 's', x: x + w / 2, y: y + h },
+    { id: 'sw', x, y: y + h },
+    { id: 'w', x, y: y + h / 2 },
   ]
 }
 
@@ -278,6 +327,12 @@ function hitTest(p: Point, ann: Annotation, threshold: number): boolean {
   switch (ann.type) {
     case 'pencil':
     case 'highlighter':
+      if (ann.rects) {
+        for (const r of ann.rects) {
+          if (p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h) return true
+        }
+        return false
+      }
       for (let i = 0; i < ann.points.length - 1; i++) {
         if (ptSegDist(p, ann.points[i], ann.points[i + 1]) < th) return true
       }
@@ -696,6 +751,60 @@ function hitTestMeasurementLabel(pt: Point, m: Measurement, threshold: number): 
   return Math.hypot(pt.x - mx, pt.y - my) < threshold
 }
 
+// ── Annotation bounding box ──────────────────────────────
+
+function getAnnotationBounds(ann: Annotation): { x: number; y: number; w: number; h: number } | null {
+  const pts = ann.points
+  if (!pts.length) return null
+  switch (ann.type) {
+    case 'text':
+    case 'callout': {
+      if (!ann.width || !ann.height) return null
+      return { x: pts[0].x, y: pts[0].y, w: ann.width, h: ann.height }
+    }
+    case 'rectangle': {
+      if (pts.length < 2) return null
+      const x = Math.min(pts[0].x, pts[1].x), y = Math.min(pts[0].y, pts[1].y)
+      return { x, y, w: Math.abs(pts[1].x - pts[0].x), h: Math.abs(pts[1].y - pts[0].y) }
+    }
+    case 'circle': {
+      if (pts.length < 2) return null
+      const x = Math.min(pts[0].x, pts[1].x), y = Math.min(pts[0].y, pts[1].y)
+      return { x, y, w: Math.abs(pts[1].x - pts[0].x), h: Math.abs(pts[1].y - pts[0].y) }
+    }
+    case 'line':
+    case 'arrow': {
+      if (pts.length < 2) return null
+      const x = Math.min(pts[0].x, pts[1].x), y = Math.min(pts[0].y, pts[1].y)
+      return { x, y, w: Math.abs(pts[1].x - pts[0].x) || 2, h: Math.abs(pts[1].y - pts[0].y) || 2 }
+    }
+    case 'pencil':
+    case 'highlighter':
+    case 'cloud': {
+      if (ann.rects && ann.rects.length > 0) {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+        for (const r of ann.rects) {
+          if (r.x < minX) minX = r.x
+          if (r.y < minY) minY = r.y
+          if (r.x + r.w > maxX) maxX = r.x + r.w
+          if (r.y + r.h > maxY) maxY = r.y + r.h
+        }
+        return { x: minX, y: minY, w: maxX - minX || 2, h: maxY - minY || 2 }
+      }
+      if (pts.length < 2) return null
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+      for (const p of pts) {
+        if (p.x < minX) minX = p.x
+        if (p.y < minY) minY = p.y
+        if (p.x > maxX) maxX = p.x
+        if (p.y > maxY) maxY = p.y
+      }
+      return { x: minX, y: minY, w: maxX - minX || 2, h: maxY - minY || 2 }
+    }
+  }
+  return null
+}
+
 // ── Canvas drawing ─────────────────────────────────────
 
 function drawAnnotation(ctx: CanvasRenderingContext2D, ann: Annotation, scale: number) {
@@ -715,8 +824,22 @@ function drawAnnotation(ctx: CanvasRenderingContext2D, ann: Annotation, scale: n
   switch (ann.type) {
     case 'pencil':
     case 'highlighter': {
+      if (ann.rects && ann.rects.length > 0) {
+        for (const r of ann.rects) {
+          ctx.fillRect(r.x * scale, r.y * scale, r.w * scale, r.h * scale)
+        }
+        break
+      }
       if (pts.length < 2) break
-      drawSmoothPath(ctx, pts, scale)
+      if (ann.smooth === false) {
+        // Straight segments (eraser fragments from shapes)
+        ctx.beginPath()
+        ctx.moveTo(pts[0].x * scale, pts[0].y * scale)
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x * scale, pts[i].y * scale)
+        ctx.stroke()
+      } else {
+        drawSmoothPath(ctx, pts, scale)
+      }
       break
     }
     case 'line': {
@@ -783,22 +906,48 @@ function drawAnnotation(ctx: CanvasRenderingContext2D, ann: Annotation, scale: n
       if (!ann.text || !pts.length) break
       const fs = (ann.fontSize || 16) * scale
       const ff = ann.fontFamily || 'Arial'
-      ctx.font = `${fs}px "${ff}", sans-serif`
+      const fontStyle = ann.italic ? 'italic' : 'normal'
+      const fontWeight = ann.bold ? 'bold' : 'normal'
+      ctx.font = `${fontStyle} ${fontWeight} ${fs}px "${ff}", sans-serif`
       ctx.textBaseline = 'top'
       ctx.globalAlpha = ann.opacity
+      const align = ann.textAlign || 'left'
 
       if (ann.width) {
-        // Textbox mode: wrap text within width
-        const lines = wrapText(ann.text, ann.width, ann.fontSize || 16)
+        const lines = wrapText(ann.text, ann.width, ann.fontSize || 16, ann.bold, (t: string) => ctx.measureText(t).width / scale)
         const lineH = (ann.fontSize || 16) * 1.3
         for (let i = 0; i < lines.length; i++) {
-          ctx.fillText(lines[i], pts[0].x * scale, (pts[0].y + lineH * i) * scale)
+          const lineY = (pts[0].y + lineH * i) * scale
+          let lineX = pts[0].x * scale
+          if (align === 'center') lineX += (ann.width * scale - ctx.measureText(lines[i]).width) / 2
+          else if (align === 'right') lineX += ann.width * scale - ctx.measureText(lines[i]).width
+          ctx.fillText(lines[i], lineX, lineY)
+          if (ann.underline) {
+            const tw = ctx.measureText(lines[i]).width
+            const uy = lineY + fs * 0.95
+            ctx.beginPath()
+            ctx.moveTo(lineX, uy)
+            ctx.lineTo(lineX + tw, uy)
+            ctx.lineWidth = Math.max(1, fs * 0.06)
+            ctx.strokeStyle = ann.color
+            ctx.stroke()
+          }
         }
       } else {
-        // Legacy single-point text
         const lines = ann.text.split('\n')
         for (let i = 0; i < lines.length; i++) {
-          ctx.fillText(lines[i], pts[0].x * scale, (pts[0].y + (ann.fontSize || 16) * 1.3 * i) * scale)
+          const lineY = (pts[0].y + (ann.fontSize || 16) * 1.3 * i) * scale
+          ctx.fillText(lines[i], pts[0].x * scale, lineY)
+          if (ann.underline) {
+            const tw = ctx.measureText(lines[i]).width
+            const uy = lineY + fs * 0.95
+            ctx.beginPath()
+            ctx.moveTo(pts[0].x * scale, uy)
+            ctx.lineTo(pts[0].x * scale + tw, uy)
+            ctx.lineWidth = Math.max(1, fs * 0.06)
+            ctx.strokeStyle = ann.color
+            ctx.stroke()
+          }
         }
       }
       break
@@ -807,34 +956,53 @@ function drawAnnotation(ctx: CanvasRenderingContext2D, ann: Annotation, scale: n
       if (!pts.length || !ann.width || !ann.height) break
       const bx = pts[0].x * scale, by = pts[0].y * scale
       const bw = ann.width * scale, bh = ann.height * scale
+      const calloutColor = ann.color || '#000000'
 
-      // White-filled box with black border
+      // White-filled box with colored border
       ctx.fillStyle = '#ffffff'
       ctx.globalAlpha = 1
       ctx.fillRect(bx, by, bw, bh)
-      ctx.strokeStyle = '#000000'
+      ctx.strokeStyle = calloutColor
       ctx.lineWidth = 1.5 * scale
       ctx.strokeRect(bx, by, bw, bh)
 
       // Text inside the box
       if (ann.text) {
-        const fs = (ann.fontSize || 14) * scale
-        const ff = ann.fontFamily || 'Arial'
-        ctx.font = `${fs}px "${ff}", sans-serif`
-        ctx.fillStyle = '#000000'
+        const cfs = (ann.fontSize || 14) * scale
+        const cff = ann.fontFamily || 'Arial'
+        const cFontStyle = ann.italic ? 'italic' : 'normal'
+        const cFontWeight = ann.bold ? 'bold' : 'normal'
+        ctx.font = `${cFontStyle} ${cFontWeight} ${cfs}px "${cff}", sans-serif`
+        ctx.fillStyle = calloutColor
         ctx.textBaseline = 'top'
-        const lines = wrapText(ann.text, ann.width, ann.fontSize || 14)
+        const cAlign = ann.textAlign || 'left'
+        const lines = wrapText(ann.text, ann.width - 8, ann.fontSize || 14, ann.bold, (t: string) => ctx.measureText(t).width / scale)
         const lineH = (ann.fontSize || 14) * 1.3
         const padding = 4 * scale
         for (let i = 0; i < lines.length; i++) {
-          ctx.fillText(lines[i], bx + padding, by + padding + lineH * i * scale)
+          const lineY = by + padding + lineH * i * scale
+          let lineX = bx + padding
+          const availW = bw - padding * 2
+          if (cAlign === 'center') lineX += (availW - ctx.measureText(lines[i]).width) / 2
+          else if (cAlign === 'right') lineX += availW - ctx.measureText(lines[i]).width
+          ctx.fillText(lines[i], lineX, lineY)
+          if (ann.underline) {
+            const tw = ctx.measureText(lines[i]).width
+            const uy = lineY + cfs * 0.95
+            ctx.beginPath()
+            ctx.moveTo(lineX, uy)
+            ctx.lineTo(lineX + tw, uy)
+            ctx.lineWidth = Math.max(1, cfs * 0.06)
+            ctx.strokeStyle = calloutColor
+            ctx.stroke()
+          }
         }
       }
 
       // Arrows from box to each tip
       if (ann.arrows && ann.arrows.length > 0) {
-        ctx.strokeStyle = '#000000'
-        ctx.fillStyle = '#000000'
+        ctx.strokeStyle = calloutColor
+        ctx.fillStyle = calloutColor
         ctx.lineWidth = 1.5 * scale
         ctx.globalAlpha = 1
         for (const tip of ann.arrows) {
@@ -863,10 +1031,11 @@ function drawAnnotation(ctx: CanvasRenderingContext2D, ann: Annotation, scale: n
 // ── Selection UI drawing ────────────────────────────────
 
 function drawSelectionUI(ctx: CanvasRenderingContext2D, ann: Annotation, scale: number) {
-  if ((ann.type !== 'text' && ann.type !== 'callout') || !ann.width || !ann.height || !ann.points.length) return
-  const { x, y } = ann.points[0]
-  const sx = x * scale, sy = y * scale
-  const sw = ann.width * scale, sh = ann.height * scale
+  const bounds = getAnnotationBounds(ann)
+  if (!bounds) return
+
+  const sx = bounds.x * scale, sy = bounds.y * scale
+  const sw = bounds.w * scale, sh = bounds.h * scale
 
   ctx.save()
   ctx.strokeStyle = '#3B82F6'
@@ -875,25 +1044,39 @@ function drawSelectionUI(ctx: CanvasRenderingContext2D, ann: Annotation, scale: 
   ctx.strokeRect(sx, sy, sw, sh)
   ctx.setLineDash([])
 
-  // Corner handles
-  const handles = getHandles(sx, sy, sw, sh)
-  ctx.fillStyle = '#ffffff'
-  ctx.strokeStyle = '#3B82F6'
-  ctx.lineWidth = 1.5
-  for (const h of handles) {
-    ctx.fillRect(h.x - HANDLE_SIZE / 2, h.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE)
-    ctx.strokeRect(h.x - HANDLE_SIZE / 2, h.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE)
+  // For text/callout: 8 resize handles. For lines/arrows: endpoint circles. For others: bounding box only.
+  if (ann.type === 'text' || ann.type === 'callout') {
+    const handles = getHandles(sx, sy, sw, sh)
+    ctx.fillStyle = '#ffffff'
+    ctx.strokeStyle = '#3B82F6'
+    ctx.lineWidth = 1.5
+    for (const h of handles) {
+      ctx.fillRect(h.x - HANDLE_SIZE / 2, h.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE)
+      ctx.strokeRect(h.x - HANDLE_SIZE / 2, h.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE)
+    }
+  } else if (ann.type === 'line' || ann.type === 'arrow') {
+    // Endpoint circles
+    ctx.fillStyle = '#ffffff'
+    ctx.strokeStyle = '#3B82F6'
+    ctx.lineWidth = 1.5
+    for (const p of ann.points.slice(0, 2)) {
+      ctx.beginPath()
+      ctx.arc(p.x * scale, p.y * scale, HANDLE_SIZE / 2 + 1, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.stroke()
+    }
   }
   ctx.restore()
 }
 
 // ── Thumbnail sidebar item ──────────────────────────────
 
-function ThumbnailItem({ pageNum, thumbnail, isCurrent, isSelected, onVisible, onClick, onDoubleClick }: {
+function ThumbnailItem({ pageNum, thumbnail, isCurrent, isSelected, hasAnnotations, onVisible, onClick, onDoubleClick }: {
   pageNum: number
   thumbnail?: string
   isCurrent: boolean
   isSelected: boolean
+  hasAnnotations: boolean
   onVisible: () => void
   onClick: () => void
   onDoubleClick: () => void
@@ -931,9 +1114,31 @@ function ThumbnailItem({ pageNum, thumbnail, isCurrent, isSelected, onVisible, o
           <span className="text-[10px] text-white/30">Loading...</span>
         </div>
       )}
-      <div className="text-center text-[10px] text-white/40 py-0.5">{pageNum}</div>
+      <div className="text-center text-[10px] text-white/40 py-0.5">
+        {pageNum}
+        {hasAnnotations && <span className="text-[8px] text-[#F47B20] ml-0.5">●</span>}
+      </div>
     </div>
   )
+}
+
+// ── Text highlight intersection helper ───────────────
+
+function findIntersectingTextItems(
+  items: { x: number; y: number; width: number; height: number }[],
+  selRect: { x: number; y: number; w: number; h: number },
+): { x: number; y: number; w: number; h: number }[] {
+  const result: { x: number; y: number; w: number; h: number }[] = []
+  for (const item of items) {
+    if (item.width <= 0) continue
+    if (item.x < selRect.x + selRect.w &&
+        item.x + item.width > selRect.x &&
+        item.y < selRect.y + selRect.h &&
+        item.y + item.height > selRect.y) {
+      result.push({ x: item.x, y: item.y, w: item.width, h: item.height })
+    }
+  }
+  return result
 }
 
 // ── Component ──────────────────────────────────────────
@@ -955,6 +1160,12 @@ export default function PdfAnnotateTool() {
   const [pdfReady, setPdfReady] = useState(0)
 
   const [fontFamily, setFontFamily] = useState('Arial')
+  const [bold, setBold] = useState(false)
+  const [italic, setItalic] = useState(false)
+  const [underline, setUnderline] = useState(false)
+  const [textAlign, setTextAlign] = useState<'left' | 'center' | 'right'>('left')
+  const [canvasCursor, setCanvasCursor] = useState<string | null>(null)
+  const clipboardRef = useRef<Annotation | null>(null)
 
   // Shapes dropdown
   const [shapesDropdownOpen, setShapesDropdownOpen] = useState(false)
@@ -987,10 +1198,12 @@ export default function PdfAnnotateTool() {
     origPoints: Point[]
     origWidth: number
     origHeight: number
+    origArrows?: Point[]
   } | null>(null)
 
   // Callout arrow drag
-  const calloutArrowDragRef = useRef<{ tipPt: Point } | null>(null)
+  const calloutArrowDragRef = useRef<{ tipPt: Point; arrowIdx?: number } | null>(null)
+  const [selectedArrowIdx, setSelectedArrowIdx] = useState<number | null>(null)
 
   // Cloud polygon placement
   const cloudPreviewRef = useRef<Point | null>(null)
@@ -1022,6 +1235,16 @@ export default function PdfAnnotateTool() {
   const isDrawingRef = useRef(false)
   const currentPtsRef = useRef<Point[]>([])
   const pageDimsRef = useRef({ width: 0, height: 0 })
+  const pdfFileRef = useRef(pdfFile)
+  pdfFileRef.current = pdfFile
+
+  // Text highlight
+  const textItemsCacheRef = useRef<Record<string, { text: string; x: number; y: number; width: number; height: number; page: number }[]>>({})
+  const textHighlightStartRef = useRef<Point | null>(null)
+  const textHighlightPreviewRectsRef = useRef<{ x: number; y: number; w: number; h: number }[]>([])
+  const [highlightDropdownOpen, setHighlightDropdownOpen] = useState(false)
+  const [activeHighlight, setActiveHighlight] = useState<'highlighter' | 'textHighlight'>('highlighter')
+  const highlightDropdownRef = useRef<HTMLDivElement>(null)
 
   // History
   const historyRef = useRef<PageAnnotations[]>([{}])
@@ -1072,6 +1295,14 @@ export default function PdfAnnotateTool() {
     return undefined
   }, [annotations, currentPage])
 
+  const findAnnotationAt = useCallback((pt: Point): Annotation | undefined => {
+    const pageAnns = annotations[currentPage] || []
+    for (let i = pageAnns.length - 1; i >= 0; i--) {
+      if (hitTest(pt, pageAnns[i], 4)) return pageAnns[i]
+    }
+    return undefined
+  }, [annotations, currentPage])
+
   // ── Render helpers ───────────────────────────────────
 
   const redraw = useCallback(() => {
@@ -1086,14 +1317,36 @@ export default function PdfAnnotateTool() {
     for (const ann of pageAnns) {
       drawAnnotation(ctx, ann, RENDER_SCALE)
       // Draw selection UI for selected text
-      if (ann.id === selectedAnnId) drawSelectionUI(ctx, ann, RENDER_SCALE)
+      if (ann.id === selectedAnnId) {
+        drawSelectionUI(ctx, ann, RENDER_SCALE)
+        // Highlight selected arrow on callout
+        if (ann.type === 'callout' && selectedArrowIdx !== null && ann.arrows && selectedArrowIdx < ann.arrows.length) {
+          const tip = ann.arrows[selectedArrowIdx]
+          const origin = nearestPointOnRect(ann.points[0].x, ann.points[0].y, ann.width!, ann.height!, tip.x, tip.y)
+          ctx.save()
+          ctx.strokeStyle = '#EF4444'
+          ctx.lineWidth = 2
+          ctx.setLineDash([5, 3])
+          ctx.beginPath()
+          ctx.moveTo(origin.x * RENDER_SCALE, origin.y * RENDER_SCALE)
+          ctx.lineTo(tip.x * RENDER_SCALE, tip.y * RENDER_SCALE)
+          ctx.stroke()
+          ctx.setLineDash([])
+          // Red circle at tip
+          ctx.fillStyle = '#EF4444'
+          ctx.beginPath()
+          ctx.arc(tip.x * RENDER_SCALE, tip.y * RENDER_SCALE, 5, 0, Math.PI * 2)
+          ctx.fill()
+          ctx.restore()
+        }
+      }
     }
 
     // Draw eraser-added fragments
     for (const frag of mods.added) drawAnnotation(ctx, frag, RENDER_SCALE)
 
     // In-progress stroke
-    if (isDrawingRef.current && activeTool !== 'eraser' && activeTool !== 'text' && activeTool !== 'callout' && activeTool !== 'cloud' && activeTool !== 'measure') {
+    if (isDrawingRef.current && activeTool !== 'eraser' && activeTool !== 'text' && activeTool !== 'callout' && activeTool !== 'cloud' && activeTool !== 'measure' && activeTool !== 'textHighlight') {
       const pts = currentPtsRef.current
       if (pts.length > 0) {
         const inProgress: Annotation = {
@@ -1104,6 +1357,18 @@ export default function PdfAnnotateTool() {
         }
         drawAnnotation(ctx, inProgress, RENDER_SCALE)
       }
+    }
+
+    // Text highlight preview (in-progress selection)
+    if (activeTool === 'textHighlight' && textHighlightPreviewRectsRef.current.length > 0) {
+      ctx.save()
+      ctx.globalAlpha = 0.4
+      ctx.globalCompositeOperation = 'multiply'
+      ctx.fillStyle = color
+      for (const r of textHighlightPreviewRectsRef.current) {
+        ctx.fillRect(r.x * RENDER_SCALE, r.y * RENDER_SCALE, r.w * RENDER_SCALE, r.h * RENDER_SCALE)
+      }
+      ctx.restore()
     }
 
     // Cloud polygon vertex placement preview
@@ -1230,7 +1495,7 @@ export default function PdfAnnotateTool() {
       }
       drawMeasurement(ctx, preview, RENDER_SCALE, calibration, false)
     }
-  }, [annotations, currentPage, activeTool, selectedAnnId, color, strokeWidth, opacity, fontSize, measurements, calibration, selectedMeasureId])
+  }, [annotations, currentPage, activeTool, selectedAnnId, color, strokeWidth, opacity, fontSize, measurements, calibration, selectedMeasureId, selectedArrowIdx])
 
   // ── History management ───────────────────────────────
 
@@ -1290,11 +1555,12 @@ export default function PdfAnnotateTool() {
 
   // ── Text editing ─────────────────────────────────────
 
-  const commitTextEditing = useCallback(() => {
+  const commitTextEditing = useCallback((preserveSelection = true) => {
     if (!editingTextId) return
     const text = editingTextValue.trim()
     if (text) {
       updateAnnotation(editingTextId, { text })
+      if (!preserveSelection) setSelectedAnnId(null)
     } else {
       removeAnnotation(editingTextId)
       setSelectedAnnId(null)
@@ -1303,12 +1569,22 @@ export default function PdfAnnotateTool() {
     setEditingTextValue('')
   }, [editingTextId, editingTextValue, updateAnnotation, removeAnnotation])
 
+  const navigateToPage = useCallback((page: number | ((p: number) => number)) => {
+    if (editingTextId) commitTextEditing(false)
+    setCurrentPage(page)
+  }, [editingTextId, commitTextEditing])
+
   const enterEditMode = useCallback((annId: string) => {
     const ann = (annotations[currentPage] || []).find(a => a.id === annId)
-    if (!ann || ann.type !== 'text') return
+    if (!ann || (ann.type !== 'text' && ann.type !== 'callout')) return
     setEditingTextId(annId)
     setEditingTextValue(ann.text || '')
     setSelectedAnnId(annId)
+    // Sync formatting state from annotation
+    setBold(ann.bold || false)
+    setItalic(ann.italic || false)
+    setUnderline(ann.underline || false)
+    setTextAlign(ann.textAlign || 'left')
   }, [annotations, currentPage])
 
   // ── Fit to window ──────────────────────────────────
@@ -1365,6 +1641,7 @@ export default function PdfAnnotateTool() {
       setSelectedMeasureId(null)
       measureStartRef.current = null
       measurePreviewRef.current = null
+      textItemsCacheRef.current = {}
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error'
       setLoadError(`Failed to load PDF: ${msg}`)
@@ -1410,29 +1687,67 @@ export default function PdfAnnotateTool() {
   // ── Re-render annotations ────────────────────────────
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { redraw() }, [pdfReady, annotations, selectedAnnId, measurements, calibration, selectedMeasureId])
+  useEffect(() => { redraw() }, [pdfReady, annotations, selectedAnnId, measurements, calibration, selectedMeasureId, selectedArrowIdx])
 
   // ── Keyboard shortcuts ───────────────────────────────
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey
-      if (editingTextId) return // Don't intercept while editing text
 
-      // Escape: cancel in-progress measurement
-      if (e.key === 'Escape' && activeTool === 'measure' && measureStartRef.current) {
+      // ── Ctrl+B/I/U while editing text ──
+      if (editingTextId && mod) {
+        const k = e.key.toLowerCase()
+        if (k === 'b' || k === 'i' || k === 'u') {
+          e.preventDefault()
+          const ann = (annotations[currentPage] || []).find(a => a.id === editingTextId)
+          if (!ann) return
+          const ta = textareaRef.current
+          const selStart = ta?.selectionStart ?? 0
+          const selEnd = ta?.selectionEnd ?? 0
+          if (k === 'b') { const v = !ann.bold; setBold(v); updateAnnotation(editingTextId, { bold: v }) }
+          if (k === 'i') { const v = !ann.italic; setItalic(v); updateAnnotation(editingTextId, { italic: v }) }
+          if (k === 'u') { const v = !ann.underline; setUnderline(v); updateAnnotation(editingTextId, { underline: v }) }
+          requestAnimationFrame(() => {
+            textareaRef.current?.focus()
+            textareaRef.current?.setSelectionRange(selStart, selEnd)
+          })
+          return
+        }
+      }
+      if (editingTextId) return // Don't intercept other keys while editing text
+
+      // ── Escape: context-dependent ──
+      if (e.key === 'Escape') {
         e.preventDefault()
-        measureStartRef.current = null
-        measurePreviewRef.current = null
-        redraw()
+        // Cancel in-progress measurement
+        if (activeTool === 'measure' && measureStartRef.current) {
+          measureStartRef.current = null; measurePreviewRef.current = null; redraw(); return
+        }
+        // Cancel in-progress cloud polygon
+        if (activeTool === 'cloud' && currentPtsRef.current.length > 0) {
+          currentPtsRef.current = []; cloudPreviewRef.current = null; redraw(); return
+        }
+        // Two-step: if selected, deselect
+        if (selectedAnnId) { setSelectedAnnId(null); return }
+        if (selectedMeasureId) { setSelectedMeasureId(null); return }
         return
       }
 
-      if (mod && e.key === 'z' && !e.shiftKey) { e.preventDefault(); undo() }
-      else if (mod && e.key === 'z' && e.shiftKey) { e.preventDefault(); redo() }
-      else if (mod && e.key === 'y') { e.preventDefault(); redo() }
-      else if ((e.key === 'Delete' || e.key === 'Backspace') && !editingTextId) {
-        // Delete selected measurement
+      // ── Undo/Redo ──
+      if (mod && e.key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); return }
+      if (mod && e.key === 'z' && e.shiftKey) { e.preventDefault(); redo(); return }
+      if (mod && e.key === 'y') { e.preventDefault(); redo(); return }
+
+      // ── Delete ──
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        // Cloud tool: Backspace to undo last vertex
+        if (e.key === 'Backspace' && activeTool === 'cloud' && currentPtsRef.current.length > 0) {
+          e.preventDefault()
+          currentPtsRef.current.pop()
+          redraw()
+          return
+        }
         if (selectedMeasureId) {
           e.preventDefault()
           setMeasurements(prev => {
@@ -1445,17 +1760,154 @@ export default function PdfAnnotateTool() {
           setSelectedMeasureId(null)
           return
         }
-        // Delete selected annotation
+        // Delete individual callout arrow
+        if (selectedArrowIdx !== null && selectedAnnId) {
+          e.preventDefault()
+          const ann = (annotations[currentPage] || []).find(a => a.id === selectedAnnId)
+          if (ann && ann.arrows && selectedArrowIdx < ann.arrows.length) {
+            const newArrows = ann.arrows.filter((_, i) => i !== selectedArrowIdx)
+            updateAnnotation(selectedAnnId, { arrows: newArrows })
+            setSelectedArrowIdx(null)
+          }
+          return
+        }
         if (selectedAnnId) {
           e.preventDefault()
           removeAnnotation(selectedAnnId)
           setSelectedAnnId(null)
+          setSelectedArrowIdx(null)
+          return
+        }
+      }
+
+      // ── Ctrl+D: Duplicate selected annotation ──
+      if (mod && e.key === 'd' && selectedAnnId) {
+        e.preventDefault()
+        const ann = (annotations[currentPage] || []).find(a => a.id === selectedAnnId)
+        if (ann) {
+          const dup: Annotation = {
+            ...structuredClone(ann),
+            id: genId(),
+            points: ann.points.map(p => ({ x: p.x + 20, y: p.y + 20 })),
+            arrows: ann.arrows?.map(p => ({ x: p.x + 20, y: p.y + 20 })),
+          }
+          commitAnnotation(dup)
+          setSelectedAnnId(dup.id)
+        }
+        return
+      }
+
+      // ── Ctrl+C: Copy selected annotation ──
+      if (mod && e.key === 'c' && selectedAnnId) {
+        e.preventDefault()
+        const ann = (annotations[currentPage] || []).find(a => a.id === selectedAnnId)
+        if (ann) clipboardRef.current = structuredClone(ann)
+        return
+      }
+
+      // ── Ctrl+V: Paste annotation from clipboard ──
+      if (mod && e.key === 'v' && clipboardRef.current) {
+        e.preventDefault()
+        const src = clipboardRef.current
+        const pasted: Annotation = {
+          ...structuredClone(src),
+          id: genId(),
+          points: src.points.map(p => ({ x: p.x + 20, y: p.y + 20 })),
+          arrows: src.arrows?.map(p => ({ x: p.x + 20, y: p.y + 20 })),
+        }
+        commitAnnotation(pasted)
+        setSelectedAnnId(pasted.id)
+        return
+      }
+
+      // ── Arrow key nudge ──
+      if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key) && selectedAnnId) {
+        e.preventDefault()
+        const step = e.shiftKey ? 10 : 1
+        const dx = e.key === 'ArrowLeft' ? -step : e.key === 'ArrowRight' ? step : 0
+        const dy = e.key === 'ArrowUp' ? -step : e.key === 'ArrowDown' ? step : 0
+        const ann = (annotations[currentPage] || []).find(a => a.id === selectedAnnId)
+        if (ann) {
+          updateAnnotation(selectedAnnId, {
+            points: ann.points.map(p => ({ x: p.x + dx, y: p.y + dy })),
+            arrows: ann.arrows?.map(p => ({ x: p.x + dx, y: p.y + dy })),
+          })
+        }
+        return
+      }
+
+      // ── Tab / Shift+Tab: cycle through text/callout boxes ──
+      if (e.key === 'Tab') {
+        const textAnns = (annotations[currentPage] || []).filter(a => a.type === 'text' || a.type === 'callout')
+        if (textAnns.length > 0) {
+          e.preventDefault()
+          const curIdx = selectedAnnId ? textAnns.findIndex(a => a.id === selectedAnnId) : -1
+          const next = e.shiftKey
+            ? (curIdx <= 0 ? textAnns.length - 1 : curIdx - 1)
+            : (curIdx >= textAnns.length - 1 ? 0 : curIdx + 1)
+          setSelectedAnnId(textAnns[next].id)
+        }
+        return
+      }
+
+      // ── Zoom shortcuts ──
+      if (mod && (e.key === '=' || e.key === '+')) {
+        e.preventDefault()
+        setZoom(z => Math.round(Math.min(4.0, z + 0.25) * 100) / 100)
+        return
+      }
+      if (mod && e.key === '-') {
+        e.preventDefault()
+        setZoom(z => Math.round(Math.max(0.25, z - 0.25) * 100) / 100)
+        return
+      }
+      if (mod && e.key === '0') {
+        e.preventDefault()
+        fitToWindow()
+        return
+      }
+
+      // ── Page navigation ──
+      if (e.key === 'PageDown') {
+        e.preventDefault()
+        navigateToPage(p => Math.min(pdfFileRef.current?.pageCount || p, p + 1))
+        return
+      }
+      if (e.key === 'PageUp') {
+        e.preventDefault()
+        navigateToPage(p => Math.max(1, p - 1))
+        return
+      }
+
+      // ── Shift+H: text highlight tool ──
+      if (e.shiftKey && !mod && !e.altKey && e.key.toLowerCase() === 'h') {
+        e.preventDefault()
+        setActiveTool('textHighlight')
+        setActiveHighlight('textHighlight')
+        return
+      }
+
+      // ── Single-letter tool switching (no modifier) ──
+      if (!mod && !e.shiftKey && !e.altKey) {
+        const toolMap: Record<string, ToolType> = {
+          p: 'pencil', l: 'line', a: 'arrow', r: 'rectangle', c: 'circle', k: 'cloud',
+          t: 'text', o: 'callout', e: 'eraser', h: 'highlighter', m: 'measure',
+        }
+        const mapped = toolMap[e.key.toLowerCase()]
+        if (mapped) {
+          e.preventDefault()
+          setActiveTool(mapped)
+          if (DRAW_TYPES.has(mapped)) setActiveDraw(mapped)
+          if (TEXT_TYPES.has(mapped)) setActiveText(mapped)
+          if (mapped === 'highlighter') setActiveHighlight('highlighter')
+          return
         }
       }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [undo, redo, selectedAnnId, editingTextId, removeAnnotation, activeTool, selectedMeasureId, redraw])
+  }, [undo, redo, selectedAnnId, editingTextId, removeAnnotation, activeTool, selectedMeasureId,
+      redraw, annotations, currentPage, commitAnnotation, updateAnnotation, fitToWindow, selectedArrowIdx, navigateToPage])
 
   // ── Zoom with scroll wheel ───────────────────────────
 
@@ -1488,8 +1940,12 @@ export default function PdfAnnotateTool() {
     setStraightLineMode(false)
     setEraserCursorPos(null)
     setSelectedAnnId(null)
+    setSelectedArrowIdx(null)
     setSelectedMeasureId(null)
-    if (activeTool === 'cloud') setColor('#ff0000')
+    textHighlightStartRef.current = null
+    textHighlightPreviewRectsRef.current = []
+    // Highlighter: default to yellow if color is the app default
+    if ((activeTool === 'highlighter' || activeTool === 'textHighlight') && color === '#F47B20') setColor('#FFFF00')
     if (editingTextId) {
       // Commit any open text edit
       commitTextEditing()
@@ -1523,20 +1979,33 @@ export default function PdfAnnotateTool() {
     return () => document.removeEventListener('pointerdown', handler)
   }, [textDropdownOpen])
 
-  // ── Escape key to cancel cloud polygon placement ────
+  // ── Close highlight dropdown on outside click ──────
 
   useEffect(() => {
-    if (activeTool !== 'cloud') return
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && currentPtsRef.current.length > 0) {
-        currentPtsRef.current = []
-        cloudPreviewRef.current = null
-        redraw()
+    if (!highlightDropdownOpen) return
+    const handler = (e: PointerEvent) => {
+      if (highlightDropdownRef.current && !highlightDropdownRef.current.contains(e.target as Node)) {
+        setHighlightDropdownOpen(false)
       }
     }
-    document.addEventListener('keydown', handler)
-    return () => document.removeEventListener('keydown', handler)
-  }, [activeTool, redraw])
+    document.addEventListener('pointerdown', handler)
+    return () => document.removeEventListener('pointerdown', handler)
+  }, [highlightDropdownOpen])
+
+  // ── Cache text items for text highlight ───────────────
+
+  useEffect(() => {
+    if (!pdfFile || activeTool !== 'textHighlight') return
+    const cacheKey = `${currentPage}_${currentRotation}`
+    if (textItemsCacheRef.current[cacheKey]) return
+    let cancelled = false
+    extractPositionedText(pdfFile, currentPage, currentRotation).then(result => {
+      if (!cancelled) {
+        textItemsCacheRef.current[cacheKey] = result.items
+      }
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [pdfFile, currentPage, currentRotation, activeTool])
 
   // ── Focus textarea when editing ──────────────────────
 
@@ -1565,6 +2034,36 @@ export default function PdfAnnotateTool() {
           setCalibrateMeasureId(m.id)
           setCalibrateValue('')
           setCalibrateModalOpen(true)
+          return
+        }
+      }
+
+      // Check if clicking near an existing endpoint → start dragging it
+      const endpointThreshold = 10 / zoom
+      for (const m of pageMeas) {
+        const dStart = Math.hypot(pt.x - m.startPt.x, pt.y - m.startPt.y)
+        const dEnd = Math.hypot(pt.x - m.endPt.x, pt.y - m.endPt.y)
+        if (dStart < endpointThreshold) {
+          setSelectedMeasureId(m.id)
+          // Drag start point: anchor is the end point
+          measureStartRef.current = m.endPt
+          measurePreviewRef.current = m.startPt
+          // Remove the measurement — it'll be recreated on release
+          setMeasurements(prev => ({
+            ...prev,
+            [currentPage]: (prev[currentPage] || []).filter(ms => ms.id !== m.id),
+          }))
+          return
+        }
+        if (dEnd < endpointThreshold) {
+          setSelectedMeasureId(m.id)
+          // Drag end point: anchor is the start point
+          measureStartRef.current = m.startPt
+          measurePreviewRef.current = m.endPt
+          setMeasurements(prev => ({
+            ...prev,
+            [currentPage]: (prev[currentPage] || []).filter(ms => ms.id !== m.id),
+          }))
           return
         }
       }
@@ -1648,10 +2147,26 @@ export default function PdfAnnotateTool() {
           // Click inside box → edit text
           if (hitTestCalloutBox(pt, ann)) {
             enterEditMode(ann.id)
+            setSelectedArrowIdx(null)
             return
           }
 
-          // Click outside box → start arrow drag
+          // Check if clicking near an existing arrow tip → select or drag it
+          if (ann.arrows && ann.arrows.length > 0) {
+            const arrowThreshold = 10 / zoom
+            for (let ai = 0; ai < ann.arrows.length; ai++) {
+              if (Math.hypot(pt.x - ann.arrows[ai].x, pt.y - ann.arrows[ai].y) < arrowThreshold) {
+                setSelectedArrowIdx(ai)
+                isDrawingRef.current = true
+                calloutArrowDragRef.current = { tipPt: pt, arrowIdx: ai }
+                redraw()
+                return
+              }
+            }
+          }
+
+          // Click outside box → start new arrow drag
+          setSelectedArrowIdx(null)
           isDrawingRef.current = true
           calloutArrowDragRef.current = { tipPt: pt }
           redraw()
@@ -1672,6 +2187,7 @@ export default function PdfAnnotateTool() {
             textDragRef.current = {
               mode: 'move', startPt: pt,
               origPoints: [...hitCallout.points], origWidth: hitCallout.width, origHeight: hitCallout.height,
+              origArrows: hitCallout.arrows ? [...hitCallout.arrows] : undefined,
             }
           }
         }
@@ -1753,6 +2269,28 @@ export default function PdfAnnotateTool() {
       return
     }
 
+    // ── Text Highlight tool: click-drag selection ──
+    if (activeTool === 'textHighlight') {
+      isDrawingRef.current = true
+      textHighlightStartRef.current = pt
+      textHighlightPreviewRectsRef.current = []
+      return
+    }
+
+    // ── Click-to-select (only for non-drawing tools) ──
+    if (!DRAW_TYPES.has(activeTool) && activeTool !== 'eraser' && activeTool !== 'highlighter' && (activeTool as ToolType) !== 'textHighlight') {
+      const hitAny = findAnnotationAt(pt)
+      if (hitAny) {
+        setSelectedAnnId(hitAny.id)
+        // Double-click text/callout → edit mode
+        if ((hitAny.type === 'text' || hitAny.type === 'callout') && e.detail >= 2) {
+          enterEditMode(hitAny.id)
+        }
+        return
+      }
+      setSelectedAnnId(null)
+    }
+
     isDrawingRef.current = true
 
     if (activeTool === 'eraser') {
@@ -1762,7 +2300,7 @@ export default function PdfAnnotateTool() {
       for (const ann of pageAnns) {
         if (eraserMode === 'object') {
           // Object mode: delete whole annotation on hit
-          if (ann.type === 'pencil' || ann.type === 'highlighter') {
+          if ((ann.type === 'pencil' || ann.type === 'highlighter') && !ann.rects) {
             const effectiveR = docRadius + ann.strokeWidth / 2
             if (pathHitsCircle(ann.points, pt, effectiveR)) eraserModsRef.current.removed.add(ann.id)
           } else if (hitTest(pt, ann, docRadius)) {
@@ -1770,7 +2308,7 @@ export default function PdfAnnotateTool() {
           }
         } else {
           // Partial mode: split paths at eraser boundary
-          if (ann.type === 'pencil' || ann.type === 'highlighter') {
+          if ((ann.type === 'pencil' || ann.type === 'highlighter') && !ann.rects) {
             const effectiveR = docRadius + ann.strokeWidth / 2
             const hasHit = pathHitsCircle(ann.points, pt, effectiveR)
             if (hasHit) {
@@ -1780,11 +2318,15 @@ export default function PdfAnnotateTool() {
           } else if (ann.type === 'text' || ann.type === 'callout') {
             if (hitTest(pt, ann, docRadius)) eraserModsRef.current.removed.add(ann.id)
           } else if (hitTest(pt, ann, docRadius)) {
-            const polyline = shapeToPolyline(ann)
-            const effectiveR = docRadius + ann.strokeWidth / 2
-            const tempAnn: Annotation = { ...ann, type: 'pencil', points: polyline }
-            eraserModsRef.current.removed.add(ann.id)
-            eraserModsRef.current.added.push(...splitPathByEraser(tempAnn, pt, effectiveR))
+            if (ann.rects) {
+              eraserModsRef.current.removed.add(ann.id)
+            } else {
+              const polyline = shapeToPolyline(ann)
+              const effectiveR = docRadius + ann.strokeWidth / 2
+              const tempAnn: Annotation = { ...ann, type: 'pencil', points: polyline, smooth: false }
+              eraserModsRef.current.removed.add(ann.id)
+              eraserModsRef.current.added.push(...splitPathByEraser(tempAnn, pt, effectiveR))
+            }
           }
         }
       }
@@ -1795,8 +2337,8 @@ export default function PdfAnnotateTool() {
     currentPtsRef.current = [pt]
     redraw()
   }, [getPoint, activeTool, annotations, currentPage, editingTextId, selectedAnnId,
-      commitTextEditing, commitAnnotation, getAnnotation, findTextAnnotationAt, findCalloutAt, enterEditMode, redraw,
-      eraserRadius, eraserMode, zoom, color, strokeWidth, fontSize, opacity])
+      commitTextEditing, commitAnnotation, getAnnotation, findTextAnnotationAt, findCalloutAt, findAnnotationAt, enterEditMode, redraw,
+      eraserRadius, eraserMode, zoom, color, strokeWidth, fontSize, opacity, fontFamily, bold, italic, underline, textAlign])
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     // Eraser cursor
@@ -1819,8 +2361,37 @@ export default function PdfAnnotateTool() {
       return
     }
 
+    // ── Cursor tracking for handles/annotations ──
+    if (!isDrawingRef.current && (activeTool === 'text' || activeTool === 'callout') && selectedAnnId) {
+      const hoverPt = getPoint(e)
+      const selAnn = (annotations[currentPage] || []).find(a => a.id === selectedAnnId)
+      if (selAnn) {
+        const handleThreshold = HANDLE_SIZE / zoom + 4
+        const handle = hitTestHandle(hoverPt, selAnn, handleThreshold)
+        if (handle) { setCanvasCursor(HANDLE_CURSOR_MAP[handle]); return }
+        if (hitTest(hoverPt, selAnn, 4)) { setCanvasCursor('move'); return }
+      }
+      setCanvasCursor(null)
+    }
+
     if (!isDrawingRef.current) return
     const pt = getPoint(e)
+
+    // Text highlight: update preview rects
+    if (activeTool === 'textHighlight' && textHighlightStartRef.current) {
+      const start = textHighlightStartRef.current
+      const selRect = {
+        x: Math.min(start.x, pt.x),
+        y: Math.min(start.y, pt.y),
+        w: Math.abs(pt.x - start.x),
+        h: Math.abs(pt.y - start.y),
+      }
+      const cacheKey = `${currentPage}_${currentRotation}`
+      const items = textItemsCacheRef.current[cacheKey] || []
+      textHighlightPreviewRectsRef.current = findIntersectingTextItems(items, selRect)
+      redraw()
+      return
+    }
 
     // Callout tool: arrow drag or move/resize
     if (activeTool === 'callout') {
@@ -1830,15 +2401,15 @@ export default function PdfAnnotateTool() {
         return
       }
       if (textDragRef.current) {
-        // Reuse text move/resize logic for callout
         const drag = textDragRef.current
         const dx = pt.x - drag.startPt.x
         const dy = pt.y - drag.startPt.y
         if (drag.mode === 'move') {
+          const movedArrows = drag.origArrows?.map(p => ({ x: p.x + dx, y: p.y + dy }))
           setAnnotations(prev => ({
             ...prev,
             [currentPage]: (prev[currentPage] || []).map(a =>
-              a.id === selectedAnnId ? { ...a, points: [{ x: drag.origPoints[0].x + dx, y: drag.origPoints[0].y + dy }] } : a
+              a.id === selectedAnnId ? { ...a, points: [{ x: drag.origPoints[0].x + dx, y: drag.origPoints[0].y + dy }], ...(movedArrows ? { arrows: movedArrows } : {}) } : a
             ),
           }))
         } else {
@@ -1850,6 +2421,10 @@ export default function PdfAnnotateTool() {
             case 'sw': newX = origPoints[0].x + dx; newW = Math.max(40, origWidth - dx); newH = Math.max(20, origHeight + dy); break
             case 'ne': newW = Math.max(40, origWidth + dx); newY = origPoints[0].y + dy; newH = Math.max(20, origHeight - dy); break
             case 'nw': newX = origPoints[0].x + dx; newY = origPoints[0].y + dy; newW = Math.max(40, origWidth - dx); newH = Math.max(20, origHeight - dy); break
+            case 'n': newY = origPoints[0].y + dy; newH = Math.max(20, origHeight - dy); break
+            case 's': newH = Math.max(20, origHeight + dy); break
+            case 'e': newW = Math.max(40, origWidth + dx); break
+            case 'w': newX = origPoints[0].x + dx; newW = Math.max(40, origWidth - dx); break
           }
           setAnnotations(prev => ({
             ...prev,
@@ -1875,7 +2450,6 @@ export default function PdfAnnotateTool() {
       if (drag.mode === 'move') {
         const newX = drag.origPoints[0].x + dx
         const newY = drag.origPoints[0].y + dy
-        // Live update without history
         setAnnotations(prev => ({
           ...prev,
           [currentPage]: (prev[currentPage] || []).map(a =>
@@ -1883,7 +2457,6 @@ export default function PdfAnnotateTool() {
           ),
         }))
       } else {
-        // Resize
         const { origPoints, origWidth, origHeight } = drag
         let newX = origPoints[0].x, newY = origPoints[0].y
         let newW = origWidth, newH = origHeight
@@ -1893,6 +2466,10 @@ export default function PdfAnnotateTool() {
           case 'sw': newX = origPoints[0].x + dx; newW = Math.max(40, origWidth - dx); newH = Math.max(20, origHeight + dy); break
           case 'ne': newW = Math.max(40, origWidth + dx); newY = origPoints[0].y + dy; newH = Math.max(20, origHeight - dy); break
           case 'nw': newX = origPoints[0].x + dx; newY = origPoints[0].y + dy; newW = Math.max(40, origWidth - dx); newH = Math.max(20, origHeight - dy); break
+          case 'n': newY = origPoints[0].y + dy; newH = Math.max(20, origHeight - dy); break
+          case 's': newH = Math.max(20, origHeight + dy); break
+          case 'e': newW = Math.max(40, origWidth + dx); break
+          case 'w': newX = origPoints[0].x + dx; newW = Math.max(40, origWidth - dx); break
         }
 
         setAnnotations(prev => ({
@@ -1920,7 +2497,7 @@ export default function PdfAnnotateTool() {
         if (mods.removed.has(ann.id)) continue
         if (eraserMode === 'object') {
           // Object mode: delete whole annotation on hit
-          if (ann.type === 'pencil' || ann.type === 'highlighter') {
+          if ((ann.type === 'pencil' || ann.type === 'highlighter') && !ann.rects) {
             const effectiveR = docRadius + ann.strokeWidth / 2
             if (pathHitsCircle(ann.points, pt, effectiveR)) mods.removed.add(ann.id)
           } else if (hitTest(pt, ann, docRadius)) {
@@ -1928,7 +2505,7 @@ export default function PdfAnnotateTool() {
           }
         } else {
           // Partial mode: split paths at eraser boundary
-          if (ann.type === 'pencil' || ann.type === 'highlighter') {
+          if ((ann.type === 'pencil' || ann.type === 'highlighter') && !ann.rects) {
             const effectiveR = docRadius + ann.strokeWidth / 2
             if (pathHitsCircle(ann.points, pt, effectiveR)) {
               mods.removed.add(ann.id)
@@ -1937,11 +2514,15 @@ export default function PdfAnnotateTool() {
           } else if (ann.type === 'text' || ann.type === 'callout') {
             if (hitTest(pt, ann, docRadius)) mods.removed.add(ann.id)
           } else if (hitTest(pt, ann, docRadius)) {
-            const polyline = shapeToPolyline(ann)
-            const effectiveR = docRadius + ann.strokeWidth / 2
-            const tempAnn: Annotation = { ...ann, type: 'pencil', points: polyline }
-            mods.removed.add(ann.id)
-            mods.added.push(...splitPathByEraser(tempAnn, pt, effectiveR))
+            if (ann.rects) {
+              mods.removed.add(ann.id)
+            } else {
+              const polyline = shapeToPolyline(ann)
+              const effectiveR = docRadius + ann.strokeWidth / 2
+              const tempAnn: Annotation = { ...ann, type: 'pencil', points: polyline, smooth: false }
+              mods.removed.add(ann.id)
+              mods.added.push(...splitPathByEraser(tempAnn, pt, effectiveR))
+            }
           }
         }
       }
@@ -1974,10 +2555,35 @@ export default function PdfAnnotateTool() {
         currentPtsRef.current.push(pt)
       }
     } else {
-      currentPtsRef.current = [currentPtsRef.current[0], pt]
+      const start = currentPtsRef.current[0]
+      let endPt = pt
+
+      // Shift-constrain
+      if (e.shiftKey && start) {
+        if (activeTool === 'rectangle') {
+          // Perfect square
+          const dx = pt.x - start.x, dy = pt.y - start.y
+          const side = Math.max(Math.abs(dx), Math.abs(dy))
+          endPt = { x: start.x + side * Math.sign(dx || 1), y: start.y + side * Math.sign(dy || 1) }
+        } else if (activeTool === 'circle') {
+          // Perfect circle
+          const dx = pt.x - start.x, dy = pt.y - start.y
+          const side = Math.max(Math.abs(dx), Math.abs(dy))
+          endPt = { x: start.x + side * Math.sign(dx || 1), y: start.y + side * Math.sign(dy || 1) }
+        } else if (activeTool === 'line' || activeTool === 'arrow') {
+          // Snap to 45° increments
+          const dx = pt.x - start.x, dy = pt.y - start.y
+          const angle = Math.atan2(dy, dx)
+          const snapped = Math.round(angle / (Math.PI / 4)) * (Math.PI / 4)
+          const dist = Math.hypot(dx, dy)
+          endPt = { x: start.x + dist * Math.cos(snapped), y: start.y + dist * Math.sin(snapped) }
+        }
+      }
+
+      currentPtsRef.current = [start, endPt]
     }
     redraw()
-  }, [getPoint, activeTool, annotations, currentPage, redraw, eraserRadius, eraserMode, zoom, straightLineMode, selectedAnnId])
+  }, [getPoint, activeTool, annotations, currentPage, currentRotation, redraw, eraserRadius, eraserMode, zoom, straightLineMode, selectedAnnId])
 
   const handlePointerUp = useCallback(() => {
     if (!isDrawingRef.current) return
@@ -1987,9 +2593,17 @@ export default function PdfAnnotateTool() {
     if (activeTool === 'callout') {
       if (calloutArrowDragRef.current && selectedAnnId) {
         const tip = calloutArrowDragRef.current.tipPt
+        const arrowIdx = calloutArrowDragRef.current.arrowIdx
         const ann = getAnnotation(selectedAnnId)
         if (ann && ann.type === 'callout') {
-          updateAnnotation(selectedAnnId, { arrows: [...(ann.arrows || []), tip] })
+          if (arrowIdx !== undefined && ann.arrows) {
+            // Repositioning existing arrow tip
+            const newArrows = ann.arrows.map((a, i) => i === arrowIdx ? tip : a)
+            updateAnnotation(selectedAnnId, { arrows: newArrows })
+          } else {
+            // Adding a new arrow
+            updateAnnotation(selectedAnnId, { arrows: [...(ann.arrows || []), tip] })
+          }
         }
         calloutArrowDragRef.current = null
         redraw()
@@ -2018,6 +2632,7 @@ export default function PdfAnnotateTool() {
           color, fontSize, fontFamily, strokeWidth: 1,
           opacity: 1,
           text: '', width: boxW, height: boxH, arrows: [],
+          bold, italic, underline, textAlign,
         }
         commitAnnotation(newAnn)
         setSelectedAnnId(newAnn.id)
@@ -2063,6 +2678,7 @@ export default function PdfAnnotateTool() {
           text: '',
           width: boxW,
           height: boxH,
+          bold, italic, underline, textAlign,
         }
         commitAnnotation(newAnn)
         setSelectedAnnId(newAnn.id)
@@ -2089,6 +2705,28 @@ export default function PdfAnnotateTool() {
       return
     }
 
+    // Text highlight: create annotation from preview rects
+    if (activeTool === 'textHighlight') {
+      const rects = textHighlightPreviewRectsRef.current
+      if (rects.length > 0) {
+        const ann: Annotation = {
+          id: genId(),
+          type: 'highlighter',
+          points: [{ x: 0, y: 0 }],
+          color,
+          strokeWidth: 0,
+          opacity: 0.4,
+          fontSize,
+          rects: [...rects],
+        }
+        commitAnnotation(ann)
+      }
+      textHighlightStartRef.current = null
+      textHighlightPreviewRectsRef.current = []
+      redraw()
+      return
+    }
+
     const pts = currentPtsRef.current
     if (pts.length < 2) {
       currentPtsRef.current = []
@@ -2099,7 +2737,7 @@ export default function PdfAnnotateTool() {
     const isHL = activeTool === 'highlighter'
     const ann: Annotation = {
       id: genId(),
-      type: activeTool as Exclude<ToolType, 'eraser' | 'measure'>,
+      type: activeTool as Exclude<ToolType, 'eraser' | 'measure' | 'textHighlight'>,
       points: [...pts],
       color,
       strokeWidth: isHL ? strokeWidth * 3 : strokeWidth,
@@ -2120,11 +2758,12 @@ export default function PdfAnnotateTool() {
     setIsExporting(true)
     setExportError(null)
     try {
-      const doc = await PDFDocument.load(pdfFile.data)
+      const bytes = await getPDFBytes(pdfFile)
+      const doc = await PDFDocument.load(bytes)
       const pages = doc.getPages()
       const fontCache = new Map<StandardFonts, Awaited<ReturnType<typeof doc.embedFont>>>()
-      const getFont = async (ff: string) => {
-        const std = PDF_FONT_MAP[ff] || StandardFonts.Helvetica
+      const getFont = async (ff: string, annBold = false, annItalic = false) => {
+        const std = resolvePdfFont(ff, annBold, annItalic)
         if (!fontCache.has(std)) fontCache.set(std, await doc.embedFont(std))
         return fontCache.get(std)!
       }
@@ -2155,13 +2794,24 @@ export default function PdfAnnotateTool() {
           switch (ann.type) {
             case 'pencil':
             case 'highlighter':
-              for (let i = 0; i < ann.points.length - 1; i++) {
-                const s = toPC(ann.points[i])
-                const e = toPC(ann.points[i + 1])
-                page.drawLine({
-                  start: s, end: e,
-                  thickness: ann.strokeWidth, color: c, opacity: ann.opacity,
-                })
+              if (ann.rects && ann.rects.length > 0) {
+                for (const rect of ann.rects) {
+                  const tl = toPC({ x: rect.x, y: rect.y + rect.h })
+                  page.drawRectangle({
+                    x: tl.x, y: tl.y,
+                    width: rect.w, height: rect.h,
+                    color: c, opacity: ann.opacity,
+                  })
+                }
+              } else {
+                for (let i = 0; i < ann.points.length - 1; i++) {
+                  const s = toPC(ann.points[i])
+                  const e = toPC(ann.points[i + 1])
+                  page.drawLine({
+                    start: s, end: e,
+                    thickness: ann.strokeWidth, color: c, opacity: ann.opacity,
+                  })
+                }
               }
               break
             case 'line':
@@ -2243,14 +2893,28 @@ export default function PdfAnnotateTool() {
             case 'text': {
               if (!ann.text || !ann.points.length) break
               const fs = ann.fontSize || 16
-              const pdfFont = await getFont(ann.fontFamily || 'Arial')
-              const lines = ann.width ? wrapText(ann.text, ann.width, fs) : ann.text.split('\n')
+              const pdfFont = await getFont(ann.fontFamily || 'Arial', ann.bold, ann.italic)
+              const lines = ann.width ? wrapText(ann.text, ann.width, fs, ann.bold, (t: string) => pdfFont.widthOfTextAtSize(t, fs)) : ann.text.split('\n')
+              const tAlign = ann.textAlign || 'left'
               for (let i = 0; i < lines.length; i++) {
-                const linePt = toPC({ x: ann.points[0].x, y: ann.points[0].y + fs * 1.3 * i + fs })
+                let xOff = 0
+                if (ann.width && tAlign !== 'left') {
+                  const tw = pdfFont.widthOfTextAtSize(lines[i], fs)
+                  if (tAlign === 'center') xOff = (ann.width - tw) / 2
+                  else if (tAlign === 'right') xOff = ann.width - tw
+                }
+                const linePt = toPC({ x: ann.points[0].x + xOff, y: ann.points[0].y + fs * 1.3 * i + fs })
                 page.drawText(lines[i], {
                   x: linePt.x, y: linePt.y,
                   size: fs, font: pdfFont, color: c, opacity: ann.opacity,
                 })
+                if (ann.underline) {
+                  const tw = pdfFont.widthOfTextAtSize(lines[i], fs)
+                  const ulY = ann.points[0].y + fs * 1.3 * i + fs + fs * 0.15
+                  const ulStart = toPC({ x: ann.points[0].x + xOff, y: ulY })
+                  const ulEnd = toPC({ x: ann.points[0].x + xOff + tw, y: ulY })
+                  page.drawLine({ start: ulStart, end: ulEnd, thickness: Math.max(0.5, fs * 0.05), color: c, opacity: ann.opacity })
+                }
               }
               break
             }
@@ -2259,25 +2923,39 @@ export default function PdfAnnotateTool() {
               const boxPt = ann.points[0]
               const cfs = ann.fontSize || 14
 
-              // White-filled box with black border
+              // White-filled box with colored border
               const bl = toPC({ x: boxPt.x, y: boxPt.y + ann.height })
               page.drawRectangle({
                 x: bl.x, y: bl.y,
                 width: ann.width, height: ann.height,
-                color: rgb(1, 1, 1), borderColor: rgb(0, 0, 0),
+                color: rgb(1, 1, 1), borderColor: c,
                 borderWidth: 1.5, opacity: 1, borderOpacity: 1,
               })
 
               // Text inside box
               if (ann.text) {
-                const calloutFont = await getFont(ann.fontFamily || 'Arial')
-                const cLines = wrapText(ann.text, ann.width - 8, cfs)
+                const calloutFont = await getFont(ann.fontFamily || 'Arial', ann.bold, ann.italic)
+                const cLines = wrapText(ann.text, ann.width - 8, cfs, ann.bold, (t: string) => calloutFont.widthOfTextAtSize(t, cfs))
+                const cAlign = ann.textAlign || 'left'
                 for (let i = 0; i < cLines.length; i++) {
-                  const lPt = toPC({ x: boxPt.x + 4, y: boxPt.y + 4 + cfs * 1.3 * i + cfs })
+                  let cxOff = 4
+                  if (cAlign !== 'left') {
+                    const ctw = calloutFont.widthOfTextAtSize(cLines[i], cfs)
+                    if (cAlign === 'center') cxOff = 4 + (ann.width - 8 - ctw) / 2
+                    else if (cAlign === 'right') cxOff = ann.width - 4 - ctw
+                  }
+                  const lPt = toPC({ x: boxPt.x + cxOff, y: boxPt.y + 4 + cfs * 1.3 * i + cfs })
                   page.drawText(cLines[i], {
                     x: lPt.x, y: lPt.y,
-                    size: cfs, font: calloutFont, color: rgb(0, 0, 0), opacity: 1,
+                    size: cfs, font: calloutFont, color: c, opacity: 1,
                   })
+                  if (ann.underline) {
+                    const ctw = calloutFont.widthOfTextAtSize(cLines[i], cfs)
+                    const culY = boxPt.y + 4 + cfs * 1.3 * i + cfs + cfs * 0.15
+                    const culStart = toPC({ x: boxPt.x + cxOff, y: culY })
+                    const culEnd = toPC({ x: boxPt.x + cxOff + ctw, y: culY })
+                    page.drawLine({ start: culStart, end: culEnd, thickness: Math.max(0.5, cfs * 0.05), color: c, opacity: 1 })
+                  }
                 }
               }
 
@@ -2294,20 +2972,76 @@ export default function PdfAnnotateTool() {
                   const abY = aE.y - aHl * Math.sin(aAngle)
                   page.drawLine({
                     start: aS, end: { x: abX, y: abY },
-                    thickness: 1.5, color: rgb(0, 0, 0), opacity: 1,
+                    thickness: 1.5, color: c, opacity: 1,
                   })
                   const aLxOff = -aHl * Math.cos(aAngle - aHalf)
                   const aLyOff = aHl * Math.sin(aAngle - aHalf)
                   const aRxOff = -aHl * Math.cos(aAngle + aHalf)
                   const aRyOff = aHl * Math.sin(aAngle + aHalf)
                   page.drawSvgPath(`M 0 0 L ${aLxOff} ${aLyOff} L ${aRxOff} ${aRyOff} Z`, {
-                    x: aE.x, y: aE.y, color: rgb(0, 0, 0), opacity: 1, borderWidth: 0,
+                    x: aE.x, y: aE.y, color: c, opacity: 1, borderWidth: 0,
                   })
                 }
               }
               break
             }
           }
+        }
+      }
+
+      // Export measurements
+      const measFont = await doc.embedFont(StandardFonts.Helvetica)
+      for (const [pageStr, pageMeas] of Object.entries(measurements)) {
+        const pageNum = parseInt(pageStr)
+        if (pageNum < 1 || pageNum > pages.length || !pageMeas.length) continue
+        const page = pages[pageNum - 1]
+        const { width: origW, height: origH } = page.getSize()
+        const rotation = pageRotations[pageNum] || 0
+        const toPC = (p: Point) => toPdfCoords(p, origW, origH, rotation)
+
+        for (const m of pageMeas) {
+          const s = toPC(m.startPt)
+          const e = toPC(m.endPt)
+          const pxDist = Math.hypot(m.endPt.x - m.startPt.x, m.endPt.y - m.startPt.y)
+
+          // Dashed cyan line
+          page.drawLine({
+            start: s, end: e,
+            thickness: 1.5, color: rgb(0.133, 0.827, 0.933), opacity: 0.9,
+            dashArray: [6, 4],
+          })
+
+          // Endpoint circles
+          for (const pt of [s, e]) {
+            page.drawCircle({
+              x: pt.x, y: pt.y, size: 3,
+              color: rgb(0.133, 0.827, 0.933), opacity: 0.9,
+            })
+          }
+
+          // Distance label
+          let label: string
+          if (calibration.pixelsPerUnit !== null) {
+            const realDist = pxDist / calibration.pixelsPerUnit
+            label = `${realDist.toFixed(2)} ${calibration.unit}`
+          } else {
+            label = `${pxDist.toFixed(1)} px`
+          }
+          const mid = toPC({ x: (m.startPt.x + m.endPt.x) / 2, y: (m.startPt.y + m.endPt.y) / 2 })
+          const tw = measFont.widthOfTextAtSize(label, 9)
+          const padX = 4
+          const padY = 2
+          // Label background pill
+          page.drawRectangle({
+            x: mid.x - tw / 2 - padX, y: mid.y - 5 - padY,
+            width: tw + padX * 2, height: 10 + padY * 2,
+            color: rgb(0, 0.16, 0.2), opacity: 0.85,
+            borderColor: rgb(0.133, 0.827, 0.933), borderWidth: 0.5, borderOpacity: 0.9,
+          })
+          page.drawText(label, {
+            x: mid.x - tw / 2, y: mid.y - 4,
+            size: 9, font: measFont, color: rgb(0.133, 0.827, 0.933), opacity: 0.9,
+          })
         }
       }
 
@@ -2336,11 +3070,13 @@ export default function PdfAnnotateTool() {
     } finally {
       setIsExporting(false)
     }
-  }, [pdfFile, annotations, pageRotations, editingTextId, commitTextEditing])
+  }, [pdfFile, annotations, pageRotations, editingTextId, commitTextEditing, measurements, calibration])
 
   // ── Reset ────────────────────────────────────────────
 
   const handleReset = useCallback(() => {
+    if (!confirm('Discard all annotations and start over?')) return
+    if (pdfFileRef.current) removePDFFromCache(pdfFileRef.current.id)
     setPdfFile(null)
     setAnnotations({})
     historyRef.current = [{}]
@@ -2456,13 +3192,41 @@ export default function PdfAnnotateTool() {
               )}
             </div>
 
-            {/* Highlighter */}
-            <button onClick={() => setActiveTool('highlighter')} title="Highlighter" aria-label="Highlighter"
-              className={`p-1.5 rounded-md transition-colors ${
-                activeTool === 'highlighter' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
-              }`}>
-              <Highlighter size={16} />
-            </button>
+            {/* Highlight tools dropdown */}
+            <div ref={highlightDropdownRef} className="relative">
+              <button
+                onClick={() => { if (activeTool !== 'highlighter' && activeTool !== 'textHighlight') setActiveTool(activeHighlight); setHighlightDropdownOpen(o => !o) }}
+                title={activeHighlight === 'highlighter' ? 'Freehand Highlight (H)' : 'Text Highlight (Shift+H)'}
+                aria-label={`Highlight tool: ${activeHighlight === 'highlighter' ? 'Freehand' : 'Text'}`}
+                className={`p-1.5 rounded-md flex items-center gap-0.5 transition-colors ${
+                  activeTool === 'highlighter' || activeTool === 'textHighlight' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
+                }`}>
+                {activeHighlight === 'textHighlight' ? <TextSelect size={16} /> : <Highlighter size={16} />}
+                <ChevronDown size={10} className="opacity-50" />
+              </button>
+              {highlightDropdownOpen && (
+                <div className="absolute top-full left-0 mt-1 bg-[#001a24] border border-white/[0.1] rounded-lg shadow-lg z-50 py-1 min-w-[180px]">
+                  <button
+                    onMouseDown={e => e.preventDefault()}
+                    onClick={() => { setActiveTool('highlighter'); setActiveHighlight('highlighter'); setHighlightDropdownOpen(false) }}
+                    className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors ${
+                      activeTool === 'highlighter' ? 'bg-[#F47B20]/20 text-[#F47B20]' : 'text-white/60 hover:text-white hover:bg-white/[0.06]'
+                    }`}>
+                    <Highlighter size={14} />
+                    Freehand Highlight (H)
+                  </button>
+                  <button
+                    onMouseDown={e => e.preventDefault()}
+                    onClick={() => { setActiveTool('textHighlight'); setActiveHighlight('textHighlight'); setHighlightDropdownOpen(false) }}
+                    className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors ${
+                      activeTool === 'textHighlight' ? 'bg-[#F47B20]/20 text-[#F47B20]' : 'text-white/60 hover:text-white hover:bg-white/[0.06]'
+                    }`}>
+                    <TextSelect size={14} />
+                    Text Highlight (Shift+H)
+                  </button>
+                </div>
+              )}
+            </div>
 
             {/* Text tools dropdown */}
             <div ref={textDropdownRef} className="relative">
@@ -2493,7 +3257,7 @@ export default function PdfAnnotateTool() {
             </div>
 
             {/* Eraser */}
-            <button onClick={() => setActiveTool('eraser')} title="Eraser" aria-label="Eraser"
+            <button onClick={() => setActiveTool('eraser')} title="Eraser (E)" aria-label="Eraser"
               className={`p-1.5 rounded-md transition-colors ${
                 activeTool === 'eraser' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
               }`}>
@@ -2501,7 +3265,7 @@ export default function PdfAnnotateTool() {
             </button>
 
             {/* Measure */}
-            <button onClick={() => setActiveTool('measure')} title="Measure" aria-label="Measure"
+            <button onClick={() => setActiveTool('measure')} title="Measure (M)" aria-label="Measure"
               className={`p-1.5 rounded-md transition-colors ${
                 activeTool === 'measure' ? 'bg-[#F47B20] text-white' : 'text-white/50 hover:text-white hover:bg-white/[0.08]'
               }`}>
@@ -2516,16 +3280,18 @@ export default function PdfAnnotateTool() {
         <div className="flex flex-col items-center gap-0.5">
           <span className="text-[8px] text-white/25 uppercase tracking-wider leading-none">Style</span>
           <div className="flex items-center gap-1">
-            {/* Color */}
-            <label className="w-7 h-7 rounded-md border border-white/[0.12] cursor-pointer flex-shrink-0 overflow-hidden"
-              style={{ backgroundColor: color }} aria-label="Annotation color">
-              <input type="color" value={color} onChange={e => setColor(e.target.value)} className="opacity-0 w-0 h-0" aria-label="Choose annotation color" />
-            </label>
+            {/* Color (hidden for eraser/measure) */}
+            {activeTool !== 'eraser' && activeTool !== 'measure' && (
+              <label className="w-7 h-7 rounded-md border border-white/[0.12] cursor-pointer flex-shrink-0 overflow-hidden"
+                style={{ backgroundColor: color }} aria-label="Annotation color">
+                <input type="color" value={color} onChange={e => setColor(e.target.value)} className="opacity-0 w-0 h-0" aria-label="Choose annotation color" />
+              </label>
+            )}
 
             {/* Stroke width */}
-            {activeTool !== 'text' && activeTool !== 'callout' && activeTool !== 'eraser' && activeTool !== 'measure' && (
+            {activeTool !== 'text' && activeTool !== 'callout' && activeTool !== 'eraser' && activeTool !== 'measure' && activeTool !== 'textHighlight' && (
               <div className="flex items-center gap-1">
-                <span className="text-[10px] text-white/40">W</span>
+                <span className="text-[10px] text-white/40" title="Stroke Width">Width</span>
                 <input type="range" min={1} max={20} value={strokeWidth}
                   onChange={e => setStrokeWidth(Number(e.target.value))}
                   className="w-16 h-1 bg-white/[0.08] rounded-full appearance-none cursor-pointer
@@ -2560,20 +3326,83 @@ export default function PdfAnnotateTool() {
               </>
             )}
 
-            {/* Text/Callout: font family & size */}
+            {/* Text/Callout: font family, size & formatting */}
             {(activeTool === 'text' || activeTool === 'callout') && (
               <>
-                <select value={fontFamily} onChange={e => setFontFamily(e.target.value)}
+                <select value={fontFamily} onChange={e => {
+                  const ff = e.target.value
+                  setFontFamily(ff)
+                  if (editingTextId) updateAnnotation(editingTextId, { fontFamily: ff })
+                  else if (selectedAnnId) {
+                    const ann = getAnnotation(selectedAnnId)
+                    if (ann && (ann.type === 'text' || ann.type === 'callout')) updateAnnotation(selectedAnnId, { fontFamily: ff })
+                  }
+                }}
                   className="px-1 py-0.5 text-[10px] bg-dark-surface border border-white/[0.1] rounded text-white max-w-[100px]">
                   {FONT_FAMILIES.map(ff => (
                     <option key={ff} value={ff} style={{ fontFamily: ff }}>{ff}</option>
                   ))}
                 </select>
                 <div className="flex items-center gap-1">
-                  <span className="text-[10px] text-white/40">Sz</span>
+                  <span className="text-[10px] text-white/40" title="Font Size">Size</span>
                   <input type="number" min={8} max={72} step={0.5} value={fontSize}
-                    onChange={e => setFontSize(Math.max(8, Math.min(72, Number(e.target.value))))}
+                    onChange={e => {
+                      const fs = Math.max(8, Math.min(72, Number(e.target.value)))
+                      setFontSize(fs)
+                      if (editingTextId) updateAnnotation(editingTextId, { fontSize: fs })
+                      else if (selectedAnnId) {
+                        const ann = getAnnotation(selectedAnnId)
+                        if (ann && (ann.type === 'text' || ann.type === 'callout')) updateAnnotation(selectedAnnId, { fontSize: fs })
+                      }
+                    }}
                     className="w-12 px-1 py-0.5 text-[10px] bg-dark-surface border border-white/[0.1] rounded text-white text-center" />
+                </div>
+
+                {/* Formatting: Bold, Italic, Underline */}
+                <div className="flex items-center gap-0.5">
+                  {([
+                    { key: 'bold' as const, Icon: Bold, label: 'Bold (Ctrl+B)', val: bold, set: setBold },
+                    { key: 'italic' as const, Icon: Italic, label: 'Italic (Ctrl+I)', val: italic, set: setItalic },
+                    { key: 'underline' as const, Icon: Underline, label: 'Underline (Ctrl+U)', val: underline, set: setUnderline },
+                  ] as const).map(({ key, Icon, label, val, set }) => (
+                    <button key={key} onMouseDown={e => e.preventDefault()} onClick={() => {
+                      const next = !val
+                      set(next)
+                      if (editingTextId) updateAnnotation(editingTextId, { [key]: next })
+                      else if (selectedAnnId) {
+                        const ann = getAnnotation(selectedAnnId)
+                        if (ann && (ann.type === 'text' || ann.type === 'callout')) updateAnnotation(selectedAnnId, { [key]: next })
+                      }
+                    }} title={label}
+                      className={`p-1 rounded transition-colors ${
+                        val ? 'bg-[#F47B20]/20 text-[#F47B20]' : 'text-white/40 hover:text-white/70'
+                      }`}>
+                      <Icon size={13} />
+                    </button>
+                  ))}
+                </div>
+
+                {/* Alignment */}
+                <div className="flex items-center gap-0.5">
+                  {([
+                    { align: 'left' as const, Icon: AlignLeft, label: 'Align Left' },
+                    { align: 'center' as const, Icon: AlignCenter, label: 'Align Center' },
+                    { align: 'right' as const, Icon: AlignRight, label: 'Align Right' },
+                  ] as const).map(({ align, Icon, label }) => (
+                    <button key={align} onMouseDown={e => e.preventDefault()} onClick={() => {
+                      setTextAlign(align)
+                      if (editingTextId) updateAnnotation(editingTextId, { textAlign: align })
+                      else if (selectedAnnId) {
+                        const ann = getAnnotation(selectedAnnId)
+                        if (ann && (ann.type === 'text' || ann.type === 'callout')) updateAnnotation(selectedAnnId, { textAlign: align })
+                      }
+                    }} title={label}
+                      className={`p-1 rounded transition-colors ${
+                        textAlign === align ? 'bg-[#F47B20]/20 text-[#F47B20]' : 'text-white/40 hover:text-white/70'
+                      }`}>
+                      <Icon size={13} />
+                    </button>
+                  ))}
                 </div>
               </>
             )}
@@ -2615,7 +3444,7 @@ export default function PdfAnnotateTool() {
             {/* Opacity (not for highlighter, eraser, or measure) */}
             {activeTool !== 'highlighter' && activeTool !== 'eraser' && activeTool !== 'measure' && (
               <div className="flex items-center gap-1">
-                <span className="text-[10px] text-white/40">O</span>
+                <span className="text-[10px] text-white/40" title="Opacity">Opacity</span>
                 <input type="range" min={10} max={100} step={5} value={opacity}
                   onChange={e => setOpacity(Number(e.target.value))}
                   className="w-14 h-1 bg-white/[0.08] rounded-full appearance-none cursor-pointer
@@ -2731,21 +3560,13 @@ export default function PdfAnnotateTool() {
                   thumbnail={thumbnails[pageNum]}
                   isCurrent={pageNum === currentPage}
                   isSelected={pageNum === selectedThumbPage}
+                  hasAnnotations={(annotations[pageNum] || []).length > 0}
                   onVisible={() => loadThumbnail(pageNum)}
-                  onClick={() => setSelectedThumbPage(pageNum)}
-                  onDoubleClick={() => { setCurrentPage(pageNum); setSelectedThumbPage(null) }}
+                  onClick={() => navigateToPage(pageNum)}
+                  onDoubleClick={() => navigateToPage(pageNum)}
                 />
               ))}
             </div>
-            {selectedThumbPage && selectedThumbPage !== currentPage && (
-              <div className="p-2 border-t border-white/[0.06]">
-                <button
-                  onClick={() => { setCurrentPage(selectedThumbPage); setSelectedThumbPage(null) }}
-                  className="w-full px-3 py-1.5 text-xs bg-[#F47B20] text-white rounded-md hover:bg-[#E06D15] transition-colors">
-                  Load Page {selectedThumbPage}
-                </button>
-              </div>
-            )}
           </div>
         )}
 
@@ -2756,10 +3577,11 @@ export default function PdfAnnotateTool() {
             <canvas
               ref={annCanvasRef}
               className="absolute top-0 left-0"
-              style={{ cursor: (activeTool === 'text' || activeTool === 'callout') && selectedAnnId ? 'default' : CURSOR_MAP[activeTool] }}
+              style={{ cursor: canvasCursor || ((activeTool === 'text' || activeTool === 'callout') && selectedAnnId ? 'default' : CURSOR_MAP[activeTool]) }}
               onPointerDown={handlePointerDown}
               onPointerMove={handlePointerMove}
               onPointerUp={handlePointerUp}
+              onPointerCancel={handlePointerUp}
               onMouseLeave={() => { if (activeTool === 'eraser') setEraserCursorPos(null) }}
             />
             {/* Eraser circle cursor */}
@@ -2779,16 +3601,33 @@ export default function PdfAnnotateTool() {
               <textarea
                 ref={textareaRef}
                 value={editingTextValue}
-                onChange={e => setEditingTextValue(e.target.value)}
+                onChange={e => {
+                  setEditingTextValue(e.target.value)
+                  // Auto-grow/shrink: adjust annotation height to fit text
+                  if (textareaRef.current && editingTextId) {
+                    requestAnimationFrame(() => {
+                      const taEl = textareaRef.current
+                      if (!taEl || !editingTextId) return
+                      const prev = taEl.style.height
+                      taEl.style.height = '0px'
+                      const needed = Math.max(DEFAULT_TEXTBOX_H, taEl.scrollHeight / RENDER_SCALE)
+                      taEl.style.height = prev
+                      if (Math.abs(needed - (editingAnn?.height || 0)) > 1) {
+                        updateAnnotation(editingTextId, { height: needed })
+                      }
+                    })
+                  }
+                }}
                 onKeyDown={e => {
                   if (e.key === 'Escape') {
                     e.preventDefault()
-                    commitTextEditing()
+                    // Two-step Escape: exit edit but preserve selection
+                    commitTextEditing(true)
                   }
                 }}
                 onBlur={() => {
                   // Small delay to allow click events to fire first
-                  setTimeout(() => commitTextEditing(), 100)
+                  setTimeout(() => commitTextEditing(true), 100)
                 }}
                 style={{
                   position: 'absolute',
@@ -2798,7 +3637,11 @@ export default function PdfAnnotateTool() {
                   height: editingAnn.height * RENDER_SCALE,
                   fontSize: (editingAnn.fontSize || (editingAnn.type === 'callout' ? 14 : 16)) * RENDER_SCALE,
                   fontFamily: `"${editingAnn.fontFamily || 'Arial'}", sans-serif`,
-                  color: editingAnn.type === 'callout' ? '#000000' : editingAnn.color,
+                  fontWeight: editingAnn.bold ? 'bold' : 'normal',
+                  fontStyle: editingAnn.italic ? 'italic' : 'normal',
+                  textDecoration: editingAnn.underline ? 'underline' : 'none',
+                  textAlign: editingAnn.textAlign || 'left',
+                  color: editingAnn.type === 'callout' ? (editingAnn.color || '#000000') : editingAnn.color,
                   backgroundColor: editingAnn.type === 'callout' ? '#ffffff' : 'transparent',
                   lineHeight: '1.3',
                   opacity: editingAnn.type === 'callout' ? 1 : editingAnn.opacity,
@@ -2816,7 +3659,7 @@ export default function PdfAnnotateTool() {
           {pdfFile.pageCount > 1 && (
             <>
               <button
-                onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                onClick={() => navigateToPage(p => Math.max(1, p - 1))}
                 disabled={currentPage === 1}
                 aria-label="Previous page"
                 className="absolute left-2 top-1/2 -translate-y-1/2 p-2 rounded-full
@@ -2826,7 +3669,7 @@ export default function PdfAnnotateTool() {
                 <ChevronLeft size={24} />
               </button>
               <button
-                onClick={() => setCurrentPage(p => Math.min(pdfFile.pageCount, p + 1))}
+                onClick={() => navigateToPage(p => Math.min(pdfFile.pageCount, p + 1))}
                 disabled={currentPage === pdfFile.pageCount}
                 aria-label="Next page"
                 className="absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-full
@@ -2852,14 +3695,26 @@ export default function PdfAnnotateTool() {
         <div className="flex-1" />
         {pdfFile.pageCount > 1 && (
           <div className="flex items-center gap-2">
-            <button onClick={() => setCurrentPage(p => Math.max(1, p - 1))} disabled={currentPage === 1}
+            <button onClick={() => navigateToPage(p => Math.max(1, p - 1))} disabled={currentPage === 1}
               className="px-2 py-1 text-xs text-white/40 hover:text-white disabled:opacity-30 rounded hover:bg-white/[0.06]">
               Prev
             </button>
-            <span className="text-xs text-white/50">
-              Page {currentPage} / {pdfFile.pageCount}
+            <span className="text-xs text-white/50 flex items-center gap-1">
+              Page{' '}
+              <input
+                type="number"
+                min={1}
+                max={pdfFile.pageCount}
+                value={currentPage}
+                onChange={e => {
+                  const val = parseInt(e.target.value)
+                  if (!isNaN(val) && val >= 1 && val <= pdfFile.pageCount) navigateToPage(val)
+                }}
+                className="w-10 px-1 py-0 text-xs text-center text-white/50 bg-transparent border border-white/[0.1] rounded focus:border-[#F47B20]/50 focus:outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+              />
+              {' '}/ {pdfFile.pageCount}
             </span>
-            <button onClick={() => setCurrentPage(p => Math.min(pdfFile.pageCount, p + 1))} disabled={currentPage === pdfFile.pageCount}
+            <button onClick={() => navigateToPage(p => Math.min(pdfFile.pageCount, p + 1))} disabled={currentPage === pdfFile.pageCount}
               className="px-2 py-1 text-xs text-white/40 hover:text-white disabled:opacity-30 rounded hover:bg-white/[0.06]">
               Next
             </button>
@@ -2870,7 +3725,17 @@ export default function PdfAnnotateTool() {
           {(measurements[currentPage] || []).length > 0 && (
             <span>· {(measurements[currentPage] || []).length} measurements</span>
           )}
-          <span>· Ctrl+scroll to zoom</span>
+          <span>· {
+            selectedAnnId ? 'Arrow keys to nudge · Del to delete · Esc to deselect' :
+            activeTool === 'text' ? 'Click+drag to create text box' :
+            activeTool === 'callout' ? 'Click+drag to create callout box' :
+            activeTool === 'cloud' ? `Click to place vertices (${currentPtsRef.current.length} placed) · Double-click to close · Backspace to undo` :
+            activeTool === 'measure' ? 'Click two points to measure' :
+            activeTool === 'textHighlight' ? 'Click+drag to highlight text' :
+            (activeTool === 'rectangle' || activeTool === 'circle' || activeTool === 'line' || activeTool === 'arrow')
+              ? 'Hold Shift for perfect shapes' :
+            'Ctrl+scroll to zoom'
+          }</span>
         </div>
       </div>
 
@@ -2881,6 +3746,9 @@ export default function PdfAnnotateTool() {
             ? (measurements[currentPage] || []).find(ms => ms.id === calibrateMeasureId)
             : null
           const pxDist = m ? Math.hypot(m.endPt.x - m.startPt.x, m.endPt.y - m.startPt.y) : 0
+          const parsedVal = parseFloat(calibrateValue)
+          const isValid = !isNaN(parsedVal) && parsedVal > 0 && pxDist > 0
+          const showError = calibrateValue.length > 0 && !isValid
           return (
             <div className="flex flex-col gap-4">
               <p className="text-sm text-white/60">
@@ -2895,16 +3763,15 @@ export default function PdfAnnotateTool() {
                   value={calibrateValue}
                   onChange={e => setCalibrateValue(e.target.value)}
                   onKeyDown={e => {
-                    if (e.key === 'Enter') {
-                      const val = parseFloat(calibrateValue)
-                      if (val > 0 && pxDist > 0) {
-                        setCalibration({ pixelsPerUnit: pxDist / val, unit: calibrateUnit })
-                        setCalibrateModalOpen(false)
-                      }
+                    if (e.key === 'Enter' && isValid) {
+                      setCalibration({ pixelsPerUnit: pxDist / parsedVal, unit: calibrateUnit })
+                      setCalibrateModalOpen(false)
                     }
                   }}
                   placeholder="e.g. 12"
-                  className="flex-1 px-3 py-2 text-sm bg-dark-surface border border-white/[0.1] rounded-lg text-white placeholder:text-white/30 focus:outline-none focus:border-[#F47B20]/50"
+                  className={`flex-1 px-3 py-2 text-sm bg-dark-surface border rounded-lg text-white placeholder:text-white/30 focus:outline-none ${
+                    showError ? 'border-red-500/50 focus:border-red-500' : 'border-white/[0.1] focus:border-[#F47B20]/50'
+                  }`}
                   autoFocus
                 />
                 <select
@@ -2919,6 +3786,9 @@ export default function PdfAnnotateTool() {
                   <option value="m">meters</option>
                 </select>
               </div>
+              {showError && (
+                <p className="text-xs text-red-400">Enter a positive number greater than 0</p>
+              )}
               <div className="flex items-center justify-between">
                 {calibration.pixelsPerUnit !== null && (
                   <button
@@ -2933,14 +3803,14 @@ export default function PdfAnnotateTool() {
                 )}
                 <div className="flex-1" />
                 <button
+                  disabled={!isValid}
                   onClick={() => {
-                    const val = parseFloat(calibrateValue)
-                    if (val > 0 && pxDist > 0) {
-                      setCalibration({ pixelsPerUnit: pxDist / val, unit: calibrateUnit })
+                    if (isValid) {
+                      setCalibration({ pixelsPerUnit: pxDist / parsedVal, unit: calibrateUnit })
                       setCalibrateModalOpen(false)
                     }
                   }}
-                  className="px-4 py-1.5 text-sm bg-[#F47B20] text-white rounded-lg hover:bg-[#F47B20]/80 transition-colors"
+                  className="px-4 py-1.5 text-sm bg-[#F47B20] text-white rounded-lg hover:bg-[#F47B20]/80 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   Apply
                 </button>

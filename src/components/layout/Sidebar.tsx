@@ -150,7 +150,7 @@ export function Sidebar() {
       {sidebarExpanded && (
         <div className="px-3 py-3 border-t border-white/[0.06]">
           <p className="text-[10px] text-white/30 text-center">
-            LotusWorks Toolkit v1.0
+            LotusWorks Toolkit v{__APP_VERSION__}
           </p>
         </div>
       )}
