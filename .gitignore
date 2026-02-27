@@ -26,3 +26,7 @@ npm-debug.log*
 # Cache
 .cache/
 .parcel-cache/
+
+# Claude / internal docs
+CLAUDE.md
+React-Audit.md
