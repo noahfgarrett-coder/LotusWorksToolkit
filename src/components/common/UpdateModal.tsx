@@ -53,6 +53,13 @@ export function UpdateModal({ open, onClose, info }: UpdateModalProps) {
           />
         )}
 
+        {/* Update instructions */}
+        <div className="rounded-lg bg-white/[0.03] border border-white/[0.06] p-3 text-xs text-white/50 space-y-1.5">
+          <p className="text-white/70 font-medium">After downloading:</p>
+          <p><span className="text-white/60 font-medium">Option A:</span> Delete your current LotusWorksToolkit.html, then move the new file to the same location. This keeps your existing bookmarks working.</p>
+          <p><span className="text-white/60 font-medium">Option B:</span> Open the downloaded file and update your bookmark to point to the new copy.</p>
+        </div>
+
         {/* Actions */}
         <div className="flex items-center gap-2 justify-end pt-1">
           <Button variant="ghost" size="sm" onClick={onClose} icon={<X size={14} />}>
